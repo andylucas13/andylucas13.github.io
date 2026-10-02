@@ -1,0 +1,1327 @@
+---
+title: "2026 Power 4 Swing Decision Report"
+subtitle: "A count-adjusted hitter decision model for Power 4 college baseball"
+author: "Andy Lucas"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: false
+    smooth-scroll: true
+    embed-resources: true
+    self-contained-math: true
+    theme:
+      light: cosmo
+    code-fold: true
+    code-tools: true
+    fig-width: 10
+    fig-height: 6
+    df-print: paged
+    grid:
+      sidebar-width: 250px
+      body-width: 1100px
+      margin-width: 120px
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(readr)
+library(gt)
+library(scales)
+library(DT)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+```{css}
+:root {
+  --ink: #000000;
+  --muted: #000000;
+  --line: #d9d9d9;
+  --panel: #ffffff;
+  --panel-strong: #ffffff;
+  --accent: #005f73;
+  --accent-2: #0a6847;
+  --bad: #9b2226;
+  --good: #0a6847;
+}
+
+body {
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+main,
+.content,
+main.content,
+#quarto-content,
+#quarto-document-content,
+.page-columns,
+.column-body {
+  background: #ffffff;
+}
+
+a,
+a:visited,
+.sidebar nav[role="doc-toc"] ul > li > a,
+.sidebar nav[role="doc-toc"] ul > li > a.active {
+  color: #000000;
+}
+
+a:hover,
+.sidebar nav[role="doc-toc"] ul > li > a:hover {
+  color: var(--accent);
+}
+
+code:not(pre code) {
+  background: transparent;
+  border: 0;
+  color: #000000;
+  font-size: 0.95em;
+  padding: 0;
+}
+
+h1, h2, h3 {
+  color: var(--ink);
+  letter-spacing: 0;
+}
+
+h1.title {
+  font-weight: 750;
+}
+
+.subtitle {
+  color: var(--muted);
+}
+
+.quarto-title-block {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 1.4rem;
+  padding-bottom: 1rem;
+}
+
+.portfolio-note {
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--accent);
+  border-radius: 10px;
+  margin: 1rem 0 1.4rem 0;
+  padding: 1rem 1.15rem;
+}
+
+.portfolio-note strong {
+  color: var(--accent);
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 0.85rem;
+  margin: 1rem 0 1.5rem 0;
+}
+
+.metric-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+
+.metric-card .value {
+  color: var(--accent);
+  display: block;
+  font-size: 1.55rem;
+  font-weight: 760;
+  line-height: 1.2;
+}
+
+.metric-card .label {
+  color: var(--muted);
+  display: block;
+  font-size: 0.86rem;
+  line-height: 1.25;
+  margin-top: 0.25rem;
+}
+
+.section-lede {
+  color: var(--ink);
+  font-size: 1.02rem;
+}
+
+#methodology,
+#methodology ~ p,
+#methodology ~ ul,
+#methodology ~ ul li {
+  color: #000000;
+}
+
+.callout-note,
+.callout-tip,
+.callout-important {
+  border-radius: 10px;
+}
+
+.dataTables_wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.dataTables_wrapper table.dataTable th,
+.dataTables_wrapper table.dataTable td {
+  white-space: nowrap !important;
+}
+
+.dataTables_wrapper table.dataTable .nowrap-cell {
+  display: inline-block;
+  white-space: nowrap !important;
+}
+
+.dataTables_wrapper table.dataTable caption {
+  caption-side: top;
+  color: var(--ink);
+  font-size: 1.05rem;
+  font-weight: 650;
+  padding-bottom: 0.5rem;
+  text-align: left;
+  white-space: normal;
+}
+
+.dataTables_wrapper thead input {
+  min-width: 92px;
+}
+
+.gt_table {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.plotly.html-widget {
+  margin-top: 0.25rem;
+}
+
+.modebar {
+  display: none !important;
+}
+```
+
+```{r project-setup}
+data_file <- "/Users/andy/Documents/Coding Projects/P4 Trackman Data/power4_trackman_pitch_by_pitch_all.csv"
+
+min_hitter_pitches <- 600
+min_p4_vs_p4_hitter_pitches <- 350
+min_team_pitches <- 500
+
+p4_conferences <- c("ACC", "Big 12", "Big Ten", "SEC")
+
+current_qmd <- knitr::current_input()
+qmd_dir <- if (is.null(current_qmd)) {
+  getwd()
+} else {
+  dirname(normalizePath(current_qmd, mustWork = FALSE))
+}
+
+outcome_layer_candidates <- c(
+  "decision_quality_outcome_layer.R",
+  "outputs/decision_quality_outcome_layer.R",
+  file.path(qmd_dir, "decision_quality_outcome_layer.R"),
+  "/Users/andy/Documents/Codex/2026-09-02/files-mentioned-by-the-user-2025/outputs/decision_quality_outcome_layer.R"
+)
+
+outcome_layer_file <- outcome_layer_candidates[file.exists(outcome_layer_candidates)][1]
+```
+
+# Project Overview
+
+This project builds a count-adjusted swing-decision model for 2026 Power 4 college baseball hitters. The goal is to separate process from outcome: did the hitter choose the right pitch to swing at before contact quality, batted-ball luck, or game result entered the evaluation?
+
+This report evaluates hitter decision quality across the 2026 Power 4 college baseball season. It is built around a simple baseball question: given the count and pitch location, did the hitter make a decision that created value?
+
+The report is split into two views. The full dataset view includes all pitches seen by Power 4 hitters in the file. The P4 vs P4 view only includes games where both teams were Power 4 programs, creating a cleaner competition-adjusted lens. Together, those views separate broad season-long approach from decisions made against comparable opponents.
+
+All leaderboards are interactive. Each table opens to 20 players or teams per page, while the full qualified pool remains available through pagination, sorting, searching, column filters, and export buttons.
+
+## Methodology
+
+The decision score is built from a count-specific attack zone and a fixed swing/take scoring chart.
+
+Each pitch is assigned to one of four zones:
+
+- `Heart`: the count-specific damage zone
+- `Paint`: the edge of the strike zone and the area just off the plate
+- `Chase`: clear balls that are still close enough to tempt swings
+- `Waste`: pitches far enough from the strike zone that hitters should almost never swing
+
+For two-strike counts, the heart zone expands to the entire strike zone. For non-two-strike counts, the heart zone expands or contracts by count. Three-ball, zero-strike counts are removed because many hitters are taking automatically.
+
+The count changes the size of the heart zone, but the value of each zone stays consistent. This keeps count adjustment in one place and makes the model easier to explain. All pitch-level decision scores are kept on a `-3` to `3` scale.
+
+`Chase%` is calculated using the standard plate-discipline definition: swings at pitches outside the strike zone divided by total pitches outside the strike zone. This is separate from the model's `Chase` and `Waste` scoring zones, which are still used to assign pitch-level decision values.
+
+```{r}
+sz_xmin <- -0.7083
+sz_xmax <-  0.7083
+sz_ymin <-  1.5
+sz_ymax <-  3.5
+
+sz_x_center <- (sz_xmin + sz_xmax) / 2
+sz_y_center <- (sz_ymin + sz_ymax) / 2
+
+dz_xmin <- -0.5
+dz_xmax <-  0.5
+dz_ymin <-  1.8
+dz_ymax <-  3.2
+
+dz_x_center <- (dz_xmin + dz_xmax) / 2
+dz_y_center <- (dz_ymin + dz_ymax) / 2
+dz_half_width <- (dz_xmax - dz_xmin) / 2
+dz_half_height <- (dz_ymax - dz_ymin) / 2
+
+swing_calls <- c(
+  "StrikeSwinging",
+  "FoulBallNotFieldable",
+  "FoulBallFieldable",
+  "FoulBall",
+  "InPlay"
+)
+
+take_calls <- c(
+  "BallCalled",
+  "BallinDirt",
+  "StrikeCalled",
+  "HitByPitch",
+  "BallIntentional",
+  "AutomaticStrike"
+)
+
+count_damage_scalars <- tibble::tribble(
+  ~Balls, ~Strikes, ~k,
+  0L,     0L,       1.00,
+  1L,     0L,       0.90,
+  2L,     0L,       0.80,
+  0L,     1L,       1.20,
+  1L,     1L,       1.00,
+  2L,     1L,       0.90,
+  3L,     1L,       0.80
+)
+
+paint_margin <- 0.25
+chase_margin <- 0.75
+
+decision_score_chart <- tibble::tribble(
+  ~attack_zone, ~swing_score, ~take_score,
+  "Heart",       3.0,         -3.0,
+  "Paint",       1.0,          0.0,
+  "Chase",      -1.5,          1.0,
+  "Waste",      -3.0,          2.0
+)
+
+safe_rate <- function(numerator, denominator) {
+  if_else(denominator > 0, numerator / denominator, NA_real_)
+}
+
+format_hitter_name <- function(name) {
+  if_else(
+    str_detect(name, ","),
+    str_replace(name, "^([^,]+),\\s*(.+)$", "\\2 \\1"),
+    name
+  )
+}
+
+add_decision_scores <- function(data) {
+  data |>
+    mutate(
+      Balls = as.integer(Balls),
+      Strikes = as.integer(Strikes),
+      PitchCall = na_if(PitchCall, ""),
+      Batter = na_if(Batter, ""),
+      BatterTeam = na_if(BatterTeam, ""),
+      BatterTeamName = na_if(BatterTeamName, "")
+    ) |>
+    filter(
+      !is.na(Batter),
+      !is.na(BatterTeam),
+      !is.na(BatterTeamName),
+      PitchCall %in% c(swing_calls, take_calls),
+      !is.na(PlateLocSide),
+      !is.na(PlateLocHeight),
+      !(Balls == 3L & Strikes == 0L)
+    ) |>
+    left_join(count_damage_scalars, by = c("Balls", "Strikes")) |>
+    mutate(
+      count = paste0(Balls, "-", Strikes),
+      dz_xmin_count = if_else(
+        Strikes == 2L,
+        sz_xmin,
+        dz_x_center - k * dz_half_width
+      ),
+      dz_xmax_count = if_else(
+        Strikes == 2L,
+        sz_xmax,
+        dz_x_center + k * dz_half_width
+      ),
+      dz_ymin_count = if_else(
+        Strikes == 2L,
+        sz_ymin,
+        dz_y_center - k * dz_half_height
+      ),
+      dz_ymax_count = if_else(
+        Strikes == 2L,
+        sz_ymax,
+        dz_y_center + k * dz_half_height
+      ),
+      in_strike_zone = PlateLocSide >= sz_xmin &
+        PlateLocSide <= sz_xmax &
+        PlateLocHeight >= sz_ymin &
+        PlateLocHeight <= sz_ymax,
+      in_damage_zone = PlateLocSide >= dz_xmin_count &
+        PlateLocSide <= dz_xmax_count &
+        PlateLocHeight >= dz_ymin_count &
+        PlateLocHeight <= dz_ymax_count,
+      in_paint_zone = PlateLocSide >= sz_xmin - paint_margin &
+        PlateLocSide <= sz_xmax + paint_margin &
+        PlateLocHeight >= sz_ymin - paint_margin &
+        PlateLocHeight <= sz_ymax + paint_margin,
+      in_chase_zone = PlateLocSide >= sz_xmin - chase_margin &
+        PlateLocSide <= sz_xmax + chase_margin &
+        PlateLocHeight >= sz_ymin - chase_margin &
+        PlateLocHeight <= sz_ymax + chase_margin,
+      attack_zone = case_when(
+        in_damage_zone ~ "Heart",
+        in_paint_zone ~ "Paint",
+        in_chase_zone ~ "Chase",
+        TRUE ~ "Waste"
+      ),
+      swing = PitchCall %in% swing_calls,
+      take = PitchCall %in% take_calls,
+      distance_to_center = sqrt(
+        (PlateLocSide - sz_x_center)^2 +
+          (PlateLocHeight - sz_y_center)^2
+      ),
+      decision_bucket = case_when(
+        swing ~ paste("Swing", attack_zone, sep = " - "),
+        take ~ paste("Take", attack_zone, sep = " - "),
+        TRUE ~ NA_character_
+      )
+    ) |>
+    left_join(decision_score_chart, by = "attack_zone") |>
+    mutate(
+      decision_score = if_else(swing, swing_score, take_score),
+      decision_score = pmax(pmin(decision_score, 3), -3),
+      decision_score_type = case_when(
+        swing & attack_zone == "Heart" ~ "Good Attack",
+        swing & attack_zone == "Paint" ~ "Paint Swing",
+        swing & attack_zone %in% c("Chase", "Waste") ~ "Chase Swing",
+        take & attack_zone == "Heart" ~ "Missed Attack",
+        take & attack_zone %in% c("Chase", "Waste") ~ "Good Take",
+        take & attack_zone == "Paint" ~ "Paint Take",
+        TRUE ~ NA_character_
+      )
+    ) |>
+    select(-swing_score, -take_score)
+}
+
+make_hitter_summary <- function(scored_data) {
+  scored_data |>
+    group_by(Batter, BatterTeam, BatterTeamName) |>
+    summarise(
+      pitches = n(),
+      swings = sum(swing, na.rm = TRUE),
+      takes = sum(!swing, na.rm = TRUE),
+      heart_pitches = sum(in_damage_zone, na.rm = TRUE),
+      out_of_zone_pitches = sum(!in_strike_zone, na.rm = TRUE),
+      mean_score = mean(decision_score, na.rm = TRUE),
+      total_score = sum(decision_score, na.rm = TRUE),
+      chase_rate = safe_rate(
+        sum(swing & !in_strike_zone, na.rm = TRUE),
+        out_of_zone_pitches
+      ),
+      damage_swing_rate = safe_rate(
+        sum(swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      damage_take_rate = safe_rate(
+        sum(!swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      two_strike_score = mean(decision_score[Strikes == 2L], na.rm = TRUE),
+      early_count_score = mean(decision_score[Balls == 0L], na.rm = TRUE),
+      ahead_count_score = mean(decision_score[Balls > Strikes], na.rm = TRUE),
+      behind_count_score = mean(decision_score[Strikes > Balls], na.rm = TRUE),
+      avg_exit_velo = mean(ExitSpeed, na.rm = TRUE),
+      hard_hit_rate = mean(ExitSpeed >= 95, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      hitter_profile = case_when(
+        damage_swing_rate >= 0.75 & chase_rate <= 0.25 ~ "Selective Attacker",
+        damage_swing_rate >= 0.75 & chase_rate > 0.35 ~ "Aggressive Expander",
+        damage_swing_rate < 0.60 & damage_take_rate >= 0.40 ~ "Overly Passive",
+        chase_rate <= 0.25 ~ "Patient / Disciplined",
+        TRUE ~ "Balanced"
+      )
+    ) |>
+    arrange(desc(mean_score))
+}
+
+make_team_summary <- function(scored_data) {
+  scored_data |>
+    group_by(BatterTeam, BatterTeamName) |>
+    summarise(
+      pitches = n(),
+      hitters = n_distinct(Batter),
+      heart_pitches = sum(in_damage_zone, na.rm = TRUE),
+      out_of_zone_pitches = sum(!in_strike_zone, na.rm = TRUE),
+      mean_score = mean(decision_score, na.rm = TRUE),
+      total_score = sum(decision_score, na.rm = TRUE),
+      chase_rate = safe_rate(
+        sum(swing & !in_strike_zone, na.rm = TRUE),
+        out_of_zone_pitches
+      ),
+      damage_swing_rate = safe_rate(
+        sum(swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      damage_take_rate = safe_rate(
+        sum(!swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      two_strike_score = mean(decision_score[Strikes == 2L], na.rm = TRUE),
+      avg_exit_velo = mean(ExitSpeed, na.rm = TRUE),
+      hard_hit_rate = mean(ExitSpeed >= 95, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(mean_score))
+}
+
+make_count_summary <- function(scored_data) {
+  scored_data |>
+    group_by(Balls, Strikes, count) |>
+    summarise(
+      pitches = n(),
+      heart_pitches = sum(in_damage_zone, na.rm = TRUE),
+      out_of_zone_pitches = sum(!in_strike_zone, na.rm = TRUE),
+      mean_score = mean(decision_score, na.rm = TRUE),
+      chase_rate = safe_rate(
+        sum(swing & !in_strike_zone, na.rm = TRUE),
+        out_of_zone_pitches
+      ),
+      damage_swing_rate = safe_rate(
+        sum(swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      damage_take_rate = safe_rate(
+        sum(!swing & in_damage_zone, na.rm = TRUE),
+        heart_pitches
+      ),
+      .groups = "drop"
+    ) |>
+    arrange(Strikes, Balls)
+}
+
+nowrap_cell <- function(x) {
+  if_else(
+    is.na(x),
+    NA_character_,
+    paste0("<span class=\"nowrap-cell\">", htmltools::htmlEscape(x), "</span>")
+  )
+}
+
+interactive_table <- function(data, caption, page_length = 20) {
+  display_data <- data |>
+    mutate(across(where(is.character), nowrap_cell))
+
+  DT::datatable(
+    display_data,
+    rownames = FALSE,
+    filter = "top",
+    extensions = "Buttons",
+    caption = caption,
+    class = "stripe hover compact nowrap",
+    escape = FALSE,
+    options = list(
+      pageLength = page_length,
+      scrollX = TRUE,
+      dom = "Bfrtip",
+      buttons = list(
+        list(extend = "copy", exportOptions = list(stripHtml = TRUE)),
+        list(extend = "csv", exportOptions = list(stripHtml = TRUE)),
+        list(extend = "excel", exportOptions = list(stripHtml = TRUE))
+      ),
+      paging = TRUE,
+      lengthMenu = list(c(20, 50, 100, -1), c("20", "50", "100", "All")),
+      autoWidth = FALSE,
+      columnDefs = list(
+        list(className = "dt-nowrap", targets = "_all")
+      )
+    )
+  )
+}
+
+clean_plotly <- function(plot, tooltip = "all") {
+  plotly::ggplotly(plot, tooltip = tooltip) |>
+    plotly::config(displayModeBar = FALSE) |>
+    plotly::layout(
+      autosize = TRUE,
+      margin = list(l = 80, r = 35, b = 80, t = 85),
+      legend = list(
+        orientation = "h",
+        x = 0,
+        y = -0.18,
+        xanchor = "left"
+      ),
+      xaxis = list(automargin = TRUE),
+      yaxis = list(automargin = TRUE)
+    )
+}
+
+format_leaderboard <- function(data, title) {
+  table_data <- data |>
+    transmute(
+      Hitter = format_hitter_name(Batter),
+      Team = BatterTeamName,
+      Pitches = pitches,
+      `Decision Score` = mean_score,
+      `Total Score` = total_score,
+      `Chase%` = chase_rate,
+      `Heart Swing%` = damage_swing_rate,
+      `Heart Take%` = damage_take_rate,
+      `2K Score` = two_strike_score,
+      `0-Ball Score` = early_count_score,
+      `Ahead Score` = ahead_count_score,
+      `Behind Score` = behind_count_score,
+      `Avg EV` = avg_exit_velo,
+      `Hard-Hit%` = hard_hit_rate,
+      Profile = hitter_profile
+    )
+
+  interactive_table(table_data, title) |>
+    formatRound(
+      columns = c("Decision Score", "Total Score", "2K Score", "0-Ball Score",
+                  "Ahead Score", "Behind Score", "Avg EV"),
+      digits = 2
+    ) |>
+    formatPercentage(
+      columns = c("Chase%", "Heart Swing%", "Heart Take%", "Hard-Hit%"),
+      digits = 1
+    )
+}
+
+format_team_leaderboard <- function(data, title) {
+  table_data <- data |>
+    transmute(
+      Team = BatterTeamName,
+      Pitches = pitches,
+      Hitters = hitters,
+      `Decision Score` = mean_score,
+      `Total Score` = total_score,
+      `Chase%` = chase_rate,
+      `Heart Swing%` = damage_swing_rate,
+      `Heart Take%` = damage_take_rate,
+      `2K Score` = two_strike_score,
+      `Avg EV` = avg_exit_velo,
+      `Hard-Hit%` = hard_hit_rate
+    )
+
+  interactive_table(table_data, title) |>
+    formatRound(columns = c("Decision Score", "Total Score", "2K Score", "Avg EV"), digits = 2) |>
+    formatPercentage(columns = c("Chase%", "Heart Swing%", "Heart Take%", "Hard-Hit%"), digits = 1)
+}
+
+format_hitter_comparison <- function(data, title) {
+  table_data <- data |>
+    transmute(
+      Hitter = format_hitter_name(Batter),
+      Team = BatterTeamName,
+      `Full Pitches` = full_pitches,
+      `P4 Pitches` = p4_pitches,
+      `Full Score` = full_mean_score,
+      `P4 Score` = p4_mean_score,
+      `Score Change` = score_change_vs_p4,
+      `Full Chase%` = full_chase_rate,
+      `P4 Chase%` = p4_chase_rate,
+      `Full Heart Swing%` = full_damage_swing_rate,
+      `P4 Heart Swing%` = p4_damage_swing_rate,
+      `Chase Change` = chase_change_vs_p4,
+      `Heart Swing Change` = damage_swing_change_vs_p4
+    )
+
+  interactive_table(table_data, title) |>
+    formatRound(columns = c("Full Score", "P4 Score", "Score Change"), digits = 2) |>
+    formatPercentage(
+      columns = c("Full Chase%", "P4 Chase%", "Full Heart Swing%", "P4 Heart Swing%",
+                  "Chase Change", "Heart Swing Change"),
+      digits = 1
+    )
+}
+
+format_team_comparison <- function(data, title) {
+  table_data <- data |>
+    transmute(
+      Team = BatterTeamName,
+      `Full Pitches` = full_pitches,
+      `P4 Pitches` = p4_pitches,
+      `Full Score` = full_mean_score,
+      `P4 Score` = p4_mean_score,
+      `Score Change` = score_change_vs_p4,
+      `Full Chase%` = full_chase_rate,
+      `P4 Chase%` = p4_chase_rate,
+      `Full Heart Swing%` = full_damage_swing_rate,
+      `P4 Heart Swing%` = p4_damage_swing_rate,
+      `Chase Change` = chase_change_vs_p4,
+      `Heart Swing Change` = damage_swing_change_vs_p4
+    )
+
+  interactive_table(table_data, title) |>
+    formatRound(columns = c("Full Score", "P4 Score", "Score Change"), digits = 2) |>
+    formatPercentage(
+      columns = c("Full Chase%", "P4 Chase%", "Full Heart Swing%", "P4 Heart Swing%",
+                  "Chase Change", "Heart Swing Change"),
+      digits = 1
+    )
+}
+
+if (is.na(outcome_layer_file)) {
+  stop("Could not find decision_quality_outcome_layer.R. Keep it in the same folder as this QMD or in the outputs folder.")
+}
+
+source(outcome_layer_file)
+```
+
+```{r}
+raw_data <- read_csv(data_file, show_col_types = FALSE) |>
+  mutate(
+    BatterTeamName = case_when(
+      TopBottom == "Top" ~ AwayTeam,
+      TopBottom == "Bottom" ~ HomeTeam,
+      TRUE ~ BatterTeam
+    ),
+    PitcherTeamName = case_when(
+      TopBottom == "Top" ~ HomeTeam,
+      TopBottom == "Bottom" ~ AwayTeam,
+      TRUE ~ PitcherTeam
+    )
+  )
+
+p4_team_ids <- raw_data |>
+  filter(IsPower4VsPower4 == TRUE) |>
+  summarise(team_id = list(sort(unique(c(BatterTeam, PitcherTeam))))) |>
+  pull(team_id) |>
+  pluck(1)
+
+full_data <- raw_data |>
+  filter(BatterTeam %in% p4_team_ids)
+
+p4_vs_p4_data <- raw_data |>
+  filter(
+    IsPower4VsPower4 == TRUE,
+    BatterTeam %in% p4_team_ids
+  )
+
+full_scored <- add_decision_scores(full_data)
+p4_vs_p4_scored <- add_decision_scores(p4_vs_p4_data)
+
+full_hitter_summary <- make_hitter_summary(full_scored)
+p4_vs_p4_hitter_summary <- make_hitter_summary(p4_vs_p4_scored)
+
+full_team_summary <- make_team_summary(full_scored)
+p4_vs_p4_team_summary <- make_team_summary(p4_vs_p4_scored)
+
+full_qualified_hitters <- full_hitter_summary |>
+  filter(pitches >= min_hitter_pitches)
+
+p4_vs_p4_qualified_hitters <- p4_vs_p4_hitter_summary |>
+  filter(pitches >= min_p4_vs_p4_hitter_pitches)
+
+full_qualified_teams <- full_team_summary |>
+  filter(pitches >= min_team_pitches)
+
+p4_vs_p4_qualified_teams <- p4_vs_p4_team_summary |>
+  filter(pitches >= min_team_pitches)
+```
+
+## Executive Summary
+
+```{r}
+analysis_snapshot <- tibble(
+  dataset = c("Full Power 4 Hitter Data", "P4 vs P4 Only"),
+  scored_pitches = c(nrow(full_scored), nrow(p4_vs_p4_scored)),
+  hitters = c(n_distinct(full_scored$Batter), n_distinct(p4_vs_p4_scored$Batter)),
+  teams = c(n_distinct(full_scored$BatterTeam), n_distinct(p4_vs_p4_scored$BatterTeam)),
+  games = c(n_distinct(full_scored$GameID), n_distinct(p4_vs_p4_scored$GameID)),
+  mean_decision_score = c(
+    mean(full_scored$decision_score, na.rm = TRUE),
+    mean(p4_vs_p4_scored$decision_score, na.rm = TRUE)
+  )
+)
+
+top_p4_hitter <- p4_vs_p4_qualified_hitters |>
+  arrange(desc(mean_score)) |>
+  slice(1)
+
+top_p4_team <- p4_vs_p4_qualified_teams |>
+  arrange(desc(mean_score)) |>
+  slice(1)
+```
+
+```{r results='asis'}
+metric_cards <- glue::glue(
+  '<div class="metric-grid">
+    <div class="metric-card"><span class="value">{scales::comma(analysis_snapshot$scored_pitches[1])}</span><span class="label">Full-schedule scored pitches</span></div>
+    <div class="metric-card"><span class="value">{scales::comma(analysis_snapshot$scored_pitches[2])}</span><span class="label">P4 vs P4 scored pitches</span></div>
+    <div class="metric-card"><span class="value">{nrow(full_qualified_hitters)}</span><span class="label">Qualified full-schedule hitters</span></div>
+    <div class="metric-card"><span class="value">{nrow(p4_vs_p4_qualified_hitters)}</span><span class="label">Qualified P4 vs P4 hitters</span></div>
+    <div class="metric-card"><span class="value">{format_hitter_name(top_p4_hitter$Batter)}</span><span class="label">Top P4 vs P4 hitter by decision score</span></div>
+    <div class="metric-card"><span class="value">{top_p4_team$BatterTeamName}</span><span class="label">Top P4 vs P4 team by decision score</span></div>
+  </div>'
+)
+
+cat(metric_cards)
+```
+
+The current model scores `r scales::comma(analysis_snapshot$scored_pitches[1])` tracked pitches in the full Power 4 hitter view and `r scales::comma(analysis_snapshot$scored_pitches[2])` tracked pitches in the P4 vs P4 view. The average decision score is `r round(analysis_snapshot$mean_decision_score[1], 3)` in the full dataset and `r round(analysis_snapshot$mean_decision_score[2], 3)` in P4 vs P4 games.
+
+The most valuable decision profile is selective aggression. Hitters are rewarded for swinging at heart pitches, receiving partial credit for competing on the paint, and getting penalized for expanding into chase or waste areas. Takes are graded the opposite way: taking heart pitches is punished, while taking chase and waste pitches is rewarded.
+
+This structure makes the model especially useful for player development conversations. A high score points to a hitter whose approach is aligned with the count and pitch location. A lower score does not automatically mean the hitter lacks talent; it points to a decision pattern worth reviewing with video, count context, and opponent plan.
+
+## Dataset Footprint
+
+```{r}
+tibble(
+  dataset = c("Full P4 Schedule Data", "P4 vs P4 Only"),
+  pitches = c(nrow(full_scored), nrow(p4_vs_p4_scored)),
+  hitters = c(n_distinct(full_scored$Batter), n_distinct(p4_vs_p4_scored$Batter)),
+  batter_teams = c(n_distinct(full_scored$BatterTeam), n_distinct(p4_vs_p4_scored$BatterTeam)),
+  games = c(n_distinct(full_scored$GameID), n_distinct(p4_vs_p4_scored$GameID)),
+  missing_scores = c(sum(is.na(full_scored$decision_score)), sum(is.na(p4_vs_p4_scored$decision_score)))
+) |>
+  gt() |>
+  tab_header(title = "Dataset Check") |>
+  cols_label(
+    dataset = "Dataset",
+    pitches = "Pitches",
+    hitters = "Hitters",
+    batter_teams = "Teams",
+    games = "Games",
+    missing_scores = "Missing Scores"
+  )
+```
+
+```{r}
+full_scored |>
+  count(PitchCall, sort = TRUE) |>
+  gt() |>
+  cols_label(
+    PitchCall = "Pitch Call",
+    n = "Pitches"
+  ) |>
+  tab_header(title = "Pitch Calls in Full Dataset")
+```
+
+# Full-Schedule Results
+
+The full dataset section is the broadest read on each Power 4 hitter's approach. It includes games against every opponent in the file, so it is best used as a season-long baseline. Because this view includes non-P4 opponents, it can be influenced by differences in command, stuff quality, and game context.
+
+## Full Dataset Hitter Leaderboard
+
+```{r}
+full_hitter_summary <- make_hitter_summary(full_scored)
+
+full_qualified_hitters <- full_hitter_summary |>
+  filter(pitches >= min_hitter_pitches)
+
+format_leaderboard(
+  full_qualified_hitters,
+  title = "Full Dataset Hitter Decision Score Leaderboard"
+)
+```
+
+## Full Dataset Team Leaderboard
+
+```{r}
+full_team_summary <- make_team_summary(full_scored)
+
+full_qualified_teams <- full_team_summary |>
+  filter(pitches >= min_team_pitches)
+
+format_team_leaderboard(
+  full_qualified_teams,
+  title = "Full Dataset Team Decision Score Leaderboard"
+)
+```
+
+## Full Dataset Count Trends
+
+```{r}
+full_count_summary <- make_count_summary(full_scored)
+
+full_count_plot <- ggplot(full_count_summary, aes(x = Balls, y = Strikes, fill = mean_score)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_score, 2)), color = "black", size = 4) +
+  scale_fill_gradient2(low = "#b2182b", mid = "white", high = "#2166ac", midpoint = 0) +
+  scale_x_continuous(breaks = 0:3) +
+  scale_y_continuous(breaks = 0:2) +
+  labs(
+    title = "Full Dataset Decision Score by Count",
+    x = "Balls",
+    y = "Strikes",
+    fill = "Mean Score"
+  ) +
+  theme_minimal()
+
+clean_plotly(full_count_plot)
+```
+
+## Full Dataset Decision Profile Plot
+
+```{r}
+full_profile_plot <- ggplot(
+  full_qualified_hitters,
+  aes(x = chase_rate, y = damage_swing_rate)
+) +
+  geom_hline(yintercept = median(full_qualified_hitters$damage_swing_rate, na.rm = TRUE), linetype = "dashed") +
+  geom_vline(xintercept = median(full_qualified_hitters$chase_rate, na.rm = TRUE), linetype = "dashed") +
+  geom_point(aes(color = mean_score), alpha = 0.75, size = 2.5) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_gradient2(low = "#9b2226", mid = "white", high = "#005f73", midpoint = 0) +
+  labs(
+    title = "Full Dataset Hitter Decision Profiles",
+    x = "Chase Rate",
+    y = "Damage-Zone Swing Rate",
+    color = "Decision Score"
+  ) +
+  theme_minimal()
+
+clean_plotly(full_profile_plot)
+```
+
+# P4 vs P4 Results
+
+The P4 vs P4 section is the cleaner comparison group. It trims the sample to matchups where both teams are Power 4 programs, which makes the leaderboard more useful for evaluating how a hitter's decision quality holds up against stronger and more comparable pitching.
+
+## P4 vs P4 Hitter Leaderboard
+
+```{r}
+p4_vs_p4_hitter_summary <- make_hitter_summary(p4_vs_p4_scored)
+
+p4_vs_p4_qualified_hitters <- p4_vs_p4_hitter_summary |>
+  filter(pitches >= min_p4_vs_p4_hitter_pitches)
+
+format_leaderboard(
+  p4_vs_p4_qualified_hitters,
+  title = "P4 vs P4 Hitter Decision Score Leaderboard"
+)
+```
+
+## P4 vs P4 Team Leaderboard
+
+```{r}
+p4_vs_p4_team_summary <- make_team_summary(p4_vs_p4_scored)
+
+p4_vs_p4_qualified_teams <- p4_vs_p4_team_summary |>
+  filter(pitches >= min_team_pitches)
+
+format_team_leaderboard(
+  p4_vs_p4_qualified_teams,
+  title = "P4 vs P4 Team Decision Score Leaderboard"
+)
+```
+
+## P4 vs P4 Count Trends
+
+```{r}
+p4_vs_p4_count_summary <- make_count_summary(p4_vs_p4_scored)
+
+p4_vs_p4_count_plot <- ggplot(p4_vs_p4_count_summary, aes(x = Balls, y = Strikes, fill = mean_score)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_score, 2)), color = "black", size = 4) +
+  scale_fill_gradient2(low = "#b2182b", mid = "white", high = "#2166ac", midpoint = 0) +
+  scale_x_continuous(breaks = 0:3) +
+  scale_y_continuous(breaks = 0:2) +
+  labs(
+    title = "P4 vs P4 Decision Score by Count",
+    x = "Balls",
+    y = "Strikes",
+    fill = "Mean Score"
+  ) +
+  theme_minimal()
+
+clean_plotly(p4_vs_p4_count_plot)
+```
+
+## P4 vs P4 Decision Profile Plot
+
+```{r}
+p4_vs_p4_profile_plot <- ggplot(
+  p4_vs_p4_qualified_hitters,
+  aes(x = chase_rate, y = damage_swing_rate)
+) +
+  geom_hline(yintercept = median(p4_vs_p4_qualified_hitters$damage_swing_rate, na.rm = TRUE), linetype = "dashed") +
+  geom_vline(xintercept = median(p4_vs_p4_qualified_hitters$chase_rate, na.rm = TRUE), linetype = "dashed") +
+  geom_point(aes(color = mean_score), alpha = 0.75, size = 2.5) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_gradient2(low = "#9b2226", mid = "white", high = "#005f73", midpoint = 0) +
+  labs(
+    title = "P4 vs P4 Hitter Decision Profiles",
+    subtitle = paste("Minimum", min_p4_vs_p4_hitter_pitches, "tracked pitches"),
+    x = "Chase Rate",
+    y = "Damage-Zone Swing Rate",
+    color = "Decision Score"
+  ) +
+  theme_minimal()
+
+clean_plotly(p4_vs_p4_profile_plot)
+```
+
+# Full Dataset vs P4 vs P4 Comparison
+
+This section compares each hitter's full-schedule decision profile to his P4 vs P4 profile. Players who improve in the P4 sample may be showing an approach that travels well against better competition. Players who fall off are not automatically poor decision-makers, but they are worth reviewing because the stricter opponent pool may expose different chase, take, or attack patterns.
+
+## Hitter Comparison
+
+```{r}
+hitter_comparison <- full_hitter_summary |>
+  select(
+    Batter,
+    BatterTeam,
+    BatterTeamName,
+    full_pitches = pitches,
+    full_mean_score = mean_score,
+    full_chase_rate = chase_rate,
+    full_damage_swing_rate = damage_swing_rate
+  ) |>
+  inner_join(
+    p4_vs_p4_hitter_summary |>
+      select(
+        Batter,
+        BatterTeam,
+        BatterTeamName,
+        p4_pitches = pitches,
+        p4_mean_score = mean_score,
+        p4_chase_rate = chase_rate,
+        p4_damage_swing_rate = damage_swing_rate
+      ),
+    by = c("Batter", "BatterTeam", "BatterTeamName")
+  ) |>
+  filter(
+    full_pitches >= min_hitter_pitches,
+    p4_pitches >= min_p4_vs_p4_hitter_pitches
+  ) |>
+  mutate(
+    score_change_vs_p4 = p4_mean_score - full_mean_score,
+    chase_change_vs_p4 = p4_chase_rate - full_chase_rate,
+    damage_swing_change_vs_p4 = p4_damage_swing_rate - full_damage_swing_rate
+  )
+
+format_hitter_comparison(
+  hitter_comparison |> arrange(desc(score_change_vs_p4)),
+  title = "Hitters Whose Decision Score Improves Most vs P4 Competition"
+)
+```
+
+## Team Comparison
+
+```{r}
+team_comparison <- full_team_summary |>
+  select(
+    BatterTeam,
+    BatterTeamName,
+    full_pitches = pitches,
+    full_mean_score = mean_score,
+    full_chase_rate = chase_rate,
+    full_damage_swing_rate = damage_swing_rate
+  ) |>
+  inner_join(
+    p4_vs_p4_team_summary |>
+      select(
+        BatterTeam,
+        BatterTeamName,
+        p4_pitches = pitches,
+        p4_mean_score = mean_score,
+        p4_chase_rate = chase_rate,
+        p4_damage_swing_rate = damage_swing_rate
+      ),
+    by = c("BatterTeam", "BatterTeamName")
+  ) |>
+  filter(
+    full_pitches >= min_team_pitches,
+    p4_pitches >= min_team_pitches
+  ) |>
+  mutate(
+    score_change_vs_p4 = p4_mean_score - full_mean_score,
+    chase_change_vs_p4 = p4_chase_rate - full_chase_rate,
+    damage_swing_change_vs_p4 = p4_damage_swing_rate - full_damage_swing_rate
+  )
+
+format_team_comparison(
+  team_comparison |> arrange(desc(p4_mean_score)),
+  title = "Team Comparison: Full Dataset vs P4 vs P4"
+)
+```
+
+## Decision Score Stability Plot
+
+```{r}
+score_stability_plot <- ggplot(
+  hitter_comparison,
+  aes(x = full_mean_score, y = p4_mean_score)
+) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_point(aes(color = score_change_vs_p4), alpha = 0.75, size = 2.5) +
+  scale_color_gradient2(low = "#9b2226", mid = "white", high = "#005f73", midpoint = 0) +
+  labs(
+    title = "Decision Score Stability Against P4 Competition",
+    x = "Full Dataset Mean Decision Score",
+    y = "P4 vs P4 Mean Decision Score",
+    color = "P4 Change"
+  ) +
+  theme_minimal()
+
+clean_plotly(score_stability_plot)
+```
+
+# Decision Quality and Offensive Output
+
+<p class="section-lede">
+
+A swing-decision model should correlate with offensive production, but it should not fully explain it. Good decisions create better swing opportunities; hitters still need bat-to-ball skill, impact, and launch quality to turn those opportunities into production.
+
+</p>
+
+```{r}
+full_complete_hitter_summary <- make_complete_hitter_summary(
+  full_hitter_summary,
+  full_scored
+) |>
+  filter(pitches >= min_hitter_pitches)
+
+p4_vs_p4_complete_hitter_summary <- make_complete_hitter_summary(
+  p4_vs_p4_hitter_summary,
+  p4_vs_p4_scored
+) |>
+  filter(pitches >= min_p4_vs_p4_hitter_pitches)
+
+decision_ops_correlation <- tibble(
+  Dataset = c("Full Dataset", "P4 vs P4"),
+  Hitters = c(
+    sum(!is.na(full_complete_hitter_summary$mean_score) & !is.na(full_complete_hitter_summary$ops)),
+    sum(!is.na(p4_vs_p4_complete_hitter_summary$mean_score) & !is.na(p4_vs_p4_complete_hitter_summary$ops))
+  ),
+  Correlation = c(
+    cor(full_complete_hitter_summary$mean_score, full_complete_hitter_summary$ops, use = "complete.obs"),
+    cor(p4_vs_p4_complete_hitter_summary$mean_score, p4_vs_p4_complete_hitter_summary$ops, use = "complete.obs")
+  )
+) |>
+  mutate(`R-Squared` = Correlation^2)
+
+p4_ops_correlation <- decision_ops_correlation |>
+  filter(Dataset == "P4 vs P4") |>
+  pull(Correlation)
+
+p4_ops_r_squared <- decision_ops_correlation |>
+  filter(Dataset == "P4 vs P4") |>
+  pull(`R-Squared`)
+
+decision_ops_correlation |>
+  interactive_table("Decision Score and OPS Correlation", page_length = 10) |>
+  formatRound(columns = c("Correlation", "R-Squared"), digits = 3)
+```
+
+The P4 vs P4 relationship is positive but modest: `r round(p4_ops_correlation, 3)` correlation and `r percent(p4_ops_r_squared, accuracy = 0.1)` of OPS variance explained by decision score alone. That supports the core interpretation: swing decisions matter, but they are only one part of offensive value.
+
+```{r}
+decision_ops_plot_data <- p4_vs_p4_complete_hitter_summary |>
+  filter(!is.na(mean_score), !is.na(ops)) |>
+  mutate(
+    Hitter = format_hitter_name(Batter),
+    hover_text = paste0(
+      Hitter,
+      "<br>Team: ", BatterTeamName,
+      "<br>Pitches: ", pitches,
+      "<br>Decision Score: ", round(mean_score, 3),
+      "<br>OPS: ", sprintf("%.3f", ops),
+      "<br>Hard-Hit%: ", percent(bip_hard_hit_rate, accuracy = 0.1),
+      "<br>Contact%: ", percent(contact_rate, accuracy = 0.1)
+    )
+  )
+
+decision_ops_plot <- ggplot(
+  decision_ops_plot_data,
+  aes(x = mean_score, y = ops, text = hover_text)
+) +
+  geom_point(aes(color = bip_hard_hit_rate), alpha = 0.75, size = 2.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#000000", linewidth = 0.8) +
+  scale_y_continuous(labels = number_format(accuracy = 0.001)) +
+  scale_color_gradient(low = "#9b2226", high = "#0a6847", labels = percent_format()) +
+  labs(
+    title = "Decision Score vs OPS",
+    subtitle = "P4 vs P4 qualified hitters",
+    x = "Mean Decision Score",
+    y = "OPS",
+    color = "Hard-Hit Rate"
+  ) +
+  theme_minimal()
+
+clean_plotly(decision_ops_plot, tooltip = "text")
+```
+
+```{r}
+p4_vs_p4_complete_hitter_summary |>
+  arrange(desc(mean_score)) |>
+  transmute(
+    Hitter = format_hitter_name(Batter),
+    Team = BatterTeamName,
+    Pitches = pitches,
+    `Decision Score` = mean_score,
+    `Contact%` = contact_rate,
+    `Whiff%` = whiff_rate,
+    `Hard-Hit%` = bip_hard_hit_rate,
+    `Avg EV` = bip_avg_exit_velo,
+    OPS = ops,
+    XBH = extra_base_hits,
+    Profile = decision_output_profile
+  ) |>
+  interactive_table("P4 vs P4 Decision Quality and Swing Output") |>
+  formatRound(columns = c("Decision Score", "Avg EV"), digits = 2) |>
+  formatRound(columns = "OPS", digits = 3) |>
+  formatPercentage(columns = c("Contact%", "Whiff%", "Hard-Hit%"), digits = 1)
+```
+
+# Example Player Pitch Map
+
+The map below shows the highest-scoring qualified hitter from the full dataset. To keep the figure readable in a portfolio report, the pitch-level decisions are grouped into three interpretation categories: attack decisions, takes, and expansion swings. The black box is the strike zone; the red box is the count-specific heart zone.
+
+```{r fig.width=11, fig.height=8}
+hitter_to_plot <- full_qualified_hitters |>
+  arrange(desc(mean_score)) |>
+  slice(1) |>
+  pull(Batter)
+
+hitter_team_to_plot <- full_qualified_hitters |>
+  arrange(desc(mean_score)) |>
+  slice(1) |>
+  pull(BatterTeamName)
+
+plot_data <- full_scored |>
+  filter(Batter == hitter_to_plot) |>
+  mutate(
+    map_decision_group = case_when(
+      swing & attack_zone %in% c("Heart", "Paint") ~ "Attack Swing",
+      swing & attack_zone %in% c("Chase", "Waste") ~ "Expansion Swing",
+      !swing ~ "Take",
+      TRUE ~ "Other"
+    ),
+    map_decision_group = factor(
+      map_decision_group,
+      levels = c("Attack Swing", "Expansion Swing", "Take", "Other")
+    )
+  )
+
+pitch_map_plot <- ggplot(plot_data, aes(x = PlateLocSide, y = PlateLocHeight)) +
+  geom_point(aes(color = map_decision_group), alpha = 0.72, size = 1.7) +
+  annotate(
+    "rect",
+    xmin = sz_xmin,
+    xmax = sz_xmax,
+    ymin = sz_ymin,
+    ymax = sz_ymax,
+    fill = NA,
+    color = "black",
+    linewidth = 1
+  ) +
+  geom_rect(
+    aes(
+      xmin = dz_xmin_count,
+      xmax = dz_xmax_count,
+      ymin = dz_ymin_count,
+      ymax = dz_ymax_count
+    ),
+    inherit.aes = FALSE,
+    fill = NA,
+    color = "#9b2226",
+    linewidth = 0.8
+  ) +
+  facet_wrap(~ count, ncol = 4) +
+  scale_x_reverse(limits = c(2, -2)) +
+  scale_y_continuous(limits = c(0, 4.75)) +
+  scale_color_manual(
+    values = c(
+      "Attack Swing" = "#0a6847",
+      "Expansion Swing" = "#9b2226",
+      "Take" = "#005f73",
+      "Other" = "#000000"
+    )
+  ) +
+  labs(
+    title = paste("Pitch Map:", format_hitter_name(hitter_to_plot)),
+    subtitle = hitter_team_to_plot,
+    x = "Plate Location Side",
+    y = "Plate Location Height",
+    color = NULL
+  ) +
+  coord_fixed(ratio = 0.85) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e5e5e5", linewidth = 0.35),
+    strip.background = element_rect(fill = "#ffffff", color = "#d9d9d9"),
+    strip.text = element_text(face = "bold", color = "#000000"),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "#000000")
+  )
+
+pitch_map_plot
+```
+
+# Project Limitations
+
+This model is designed to evaluate decision quality, not complete hitting ability. A strong decision score means the hitter generally chose appropriate pitches to swing at or take based on count and location. It does not guarantee that the hitter made quality contact, controlled the barrel, or produced positive run value.
+
+Key limitations:
+
+- **Strike-zone assumptions:** The model uses fixed strike-zone boundaries rather than hitter-specific zones. That keeps the method consistent across teams, but it may miss player-specific differences in height, stance, or TrackMan zone calibration.
+- **Damage-zone assumptions:** The heart zone is count-adjusted, but the zone shapes and scoring values are still model choices. They are explainable and easy to tune, but they should be reviewed with coaching input.
+- **Context not fully modeled:** Pitch type, pitch quality, pitcher handedness, game state, and hitter plan are not directly included in the decision score.
+- **OPS is an outcome layer, not the target:** The correlation with OPS is useful validation context, but the decision model should not be expected to fully explain offensive production.
+- **P4 vs P4 improves comparability, not perfection:** The P4 vs P4 split controls for competition level better than the full dataset, but it still contains differences in opponent quality, parks, weather, and schedules.
+- **Called-zone uncertainty:** Takes near the border can be affected by umpire zone, catcher presentation, and count leverage. The model treats pitch location mechanically.
+
+# Interpretation and Takeaways
+
+The most actionable use of this report is grouping hitters by decision patterns. High-score hitters with low chase rates and strong heart-zone swing rates are strong approach models. Hitters with elevated chase rates may need better pitch-shape recognition or a tighter two-strike plan. Hitters with high heart take rates may need a more aggressive attack plan in counts where damage is available.
+
+This report should be read as a process metric. It does not replace production stats, bat speed, contact quality, or scouting context. Its value is that it shows whether the hitter consistently chose the right pitch to swing at before the result of that pitch entered the evaluation.
+
+```{r}
+full_qualified_hitters |>
+  transmute(
+    Hitter = format_hitter_name(Batter),
+    Team = BatterTeamName,
+    Profile = hitter_profile,
+    Pitches = pitches,
+    `Decision Score` = mean_score,
+    `Chase%` = chase_rate,
+    `Heart Swing%` = damage_swing_rate,
+    `Heart Take%` = damage_take_rate,
+    `2K Score` = two_strike_score
+  ) |>
+  interactive_table("Coach-Facing Hitter Profiles") |>
+  formatRound(columns = c("Decision Score", "2K Score"), digits = 2) |>
+  formatPercentage(columns = c("Chase%", "Heart Swing%", "Heart Take%"), digits = 1)
+```
