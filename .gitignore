@@ -1,0 +1,10 @@
+data/*.csv
+data/*.parquet
+data/*.rds
+model_output/
+*_cache/
+*_files/
+*.rmarkdown
+.RData
+.Rhistory
+.DS_Store
