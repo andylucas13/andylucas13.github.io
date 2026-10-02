@@ -1,0 +1,543 @@
+---
+title: "Capstone"
+author: "Andrew Lucas"
+format: pdf
+---
+
+```{r}
+library(readr)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(randomForest)
+library(pdp)
+library(knitr)
+```
+
+#### CSV Load
+
+```{r}
+acc_game_data <- read_csv("~/Documents/Capstone/acc_trackman_game_csvs/acc_trackman_pitch_by_pitch_all.csv")
+```
+
+# EDA
+
+#### EDA #1: Exit Velocity vs Launch Angle Scatterplot
+
+```{r}
+ev_la_setup <- acc_game_data |>
+  mutate(
+    outcome_group = case_when(
+      PlayResult == "HomeRun" ~ "HomeRun",
+      PlayResult %in% c("Double", "Triple") ~ "XBH",
+      PlayResult == "Single" ~ "Single", 
+      TRUE ~ "Out"))
+
+ev_la_plot <- ev_la_setup |>
+  ggplot(aes(x = Angle, y = ExitSpeed, color = outcome_group, alpha = outcome_group)) + 
+  geom_point(size = 1.2) + 
+  scale_color_manual( values = c(
+    "Out" = "lightgrey", 
+    "Single" = "royalblue", 
+    "XBH" = "forestgreen",
+    "HomeRun" = "darkred")) +
+  scale_alpha_manual(values = c("Out" = 0.18,
+    "Single" = 0.75,
+    "XBH" = 0.75,
+    "HomeRun" = 0.85), guide = "none") +
+  labs(
+    title = "Exit Velocity vs Launch Angle",
+    subtitle = "ACC 2026 Trackman Data",
+    x = "Launch Angle",
+    y = "Exit Velocity",
+    color = "Play Result") +
+  theme_bw() + 
+  theme(legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.8, "cm"))
+ev_la_plot
+```
+
+#### EDA Relations and Analysis
+
+This scatterplot is directly related to my main research question of which contact quality variables lead to the most consistent offensive success over the course of a season. Exit Velocity measures how hard the ball is hit, while Launch Angle measures the angle that the ball leaves the bat. These metrics are important because different combinations of exit velocity and launch angle are associated with very different outcomes. By creating a scatterplot of Exit Velocity and Launch Angle colored by the play outcome, I am able to visually see which contact profiles are most associated with offensive success.
+
+From this plot, I expect to see that the most successful offensive outcomes are concentrated within specific combinations of Exit Velocity and Launch Angle. From the scatterplot we see that Home runs appear to cluster in a region with high exit velocities and launch angles around 25 degrees, which shows the ideal combination of power and trajectory for producing big time damage. While weaker hit balls and launch angles outside the 25 degree range tend to produce more outs, it is important to note these balls can still result in hits if they are placed in areas of the field where a defender has a very low chance to make a play. These patterns suggest that both contact quality and ball placement play major roles in offensive success, while also supporting the idea that Exit Velocity and Launch Angle can be strong predictors of hitter performance over the course of a season.
+
+#### EDA #2: Plot that shows Slugging Percentage per Region in the Strike Zone
+
+```{r}
+#Grouping pitches by similar movement and velocity profiles
+pitch_buckets <- acc_game_data |>
+  filter(!is.na(TaggedPitchType), TaggedPitchType != "Undefined") |>
+  mutate(
+    PitchGroup = case_when(
+      TaggedPitchType %in% 
+        c("FourSeamFastBall", "Fastball", "OneSeamFastBall")
+      ~ "Fastball",
+      
+      TaggedPitchType %in% 
+        c("Sinker", "TwoSeamFastBall", "Cutter") 
+      ~ "Sinker/Cutter",
+      
+      TaggedPitchType %in% 
+        c("ChangeUp", "Splitter") 
+      ~ "Changeup",
+      
+      TaggedPitchType %in% 
+        c("Slider", "Curveball", "Sweeper", "Knuckleball") 
+      ~ "Breaking Ball",
+      TRUE ~ "Other")) |>
+  filter(PitchGroup != "Other")
+```
+
+```{r}
+  #Creating Strike Zone Regions and beginning of slugging percentage calculation
+  
+  strikezone_slug <- pitch_buckets |>
+    filter(!is.na(PlateLocSide), !is.na(PlateLocHeight), 
+           PlayResult %in% c(
+             "Single", "Double", "Triple", "HomeRun", "Out", "Error", "FieldersChoice")) |>
+    mutate(
+      ZoneRegion = case_when(
+        PlateLocHeight > 3.5 ~ "Up Out of Zone",
+        PlateLocHeight < 1.5 ~ "Down Out of Zone",
+        PlateLocSide < -.708 ~ "Left Out of Zone", 
+        PlateLocSide > .708 ~  "Right Out of Zone", 
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Up Left",
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Up Middle",
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Up Right",
+        
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Middle Left",
+      
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Middle Middle",
+      
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Middle Right",
+        
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Down Left",
+      
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Down Middle",
+      
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Down Right"), 
+      
+      TotalBases = case_when(
+      PlayResult == "Single" ~ 1,
+      PlayResult == "Double" ~ 2,
+      PlayResult == "Triple" ~ 3,
+      PlayResult == "HomeRun" ~ 4,
+      TRUE ~ 0)) |>
+    group_by(PitchGroup, ZoneRegion) |>
+    summarise( 
+      AB = n(), 
+      TotalBases = sum(TotalBases, na.rm = TRUE),
+      SLG = TotalBases / AB, 
+      .groups = "drop")
+```
+
+```{r}
+#Creating the Plot
+
+zone_slug_plot_setup <- strikezone_slug |>
+  mutate(
+    x = case_when(
+      ZoneRegion %in% c("Up Left", "Middle Left", "Down Left") ~ 1,
+      ZoneRegion %in% c("Up Middle", "Middle Middle", "Down Middle") ~ 2,
+      ZoneRegion %in% c("Up Right", "Middle Right", "Down Right") ~ 3,
+      ZoneRegion == "Left Out of Zone" ~ 0,
+      ZoneRegion == "Right Out of Zone" ~ 4), 
+    y = case_when(
+      ZoneRegion %in% c("Up Left", "Up Middle", "Up Right") ~ 3,
+      ZoneRegion %in% c("Middle Left", "Middle Middle", "Middle Right") ~ 2,
+      ZoneRegion %in% c("Down Left", "Down Middle", "Down Right") ~ 1,
+      ZoneRegion == "Up Out of Zone" ~ 4,
+      ZoneRegion == "Down Out of Zone" ~ 0))
+zoneslug_plot <- zone_slug_plot_setup |>
+  distinct(PitchGroup, ZoneRegion, .keep_all = TRUE) |>
+  ggplot(aes(x = x, y = y, fill = SLG)) + 
+  geom_tile(color = "black") +
+  geom_text(aes(label = round(SLG, 3)), color = "white", size = 4, fontface = "bold") +
+  facet_wrap(~ PitchGroup) +
+  scale_x_continuous(
+    breaks = c(1,2,3),
+    labels = c("Left", "Middle", "Right")) +
+  scale_y_continuous(
+    breaks = c(1,2,3),
+    labels = c("Down", "Middle", "Up")) +
+  scale_fill_gradient(low = "navy", high = "red") +
+  labs(title = "Slugging Percentage by Strike Zone Region", x = NULL, y = NULL, fill = "Slugging %") +
+  coord_fixed() +
+  theme_bw()
+```
+
+```{r, fig.width=10, fig.height=8}
+zoneslug_plot
+```
+
+#### EDA Relations and Analysis
+
+This EDA directly relates to my research question because my project is trying to determine which variables contribute most to offensive success throughout the course of a full season. While my first EDA focused more on contact metrics such as Exit Velocity and Launch Angle, this plot is more focused on pitch location and how different pitch types perform in different areas of the strike zone. By calculating slugging percentage in each region and separating by pitch group, I can see which pitch locations are associated with big time offensive damage.
+
+From this visual, pitches located in the middle of the strike zone consistently produce the highest slug across all pitch groups. In particular, changeups left in the middle-middle zone appear to generate the most offensive damage, while executed breaking balls lower in the zone are better at suppressing slug. These patterns suggest that both pitch type and location play a big role in offensive production. Overall, the heatmaps support the idea that mistakes left in hittable areas of the strike zone are much more likely to result in extra-base damage, which aligns closely with my research question regarding the factors that contribute to offensive success.
+
+# Statistical Modeling
+
+### Correlation Analysis
+
+```{r}
+player_test <- acc_game_data |> 
+  group_by(Batter) |>
+  summarise(
+    TotalBases = sum(case_when(
+      PlayResult == "Single" ~ 1,
+      PlayResult == "Double" ~ 2,
+      PlayResult == "Triple" ~ 3,
+      PlayResult == "HomeRun" ~ 4,
+      TRUE ~ 0)), 
+    AB = sum(PlayResult %in% c(
+             "Single", "Double", "Triple", "HomeRun", "Out", "Error", "FieldersChoice"), na.rm = TRUE), 
+    avg_ev = mean(ExitSpeed, na.rm = TRUE),
+    avg_la = mean(Angle, na.rm = TRUE),
+    SLG = TotalBases / AB, .groups = "drop") 
+player_test <- player_test |> 
+  filter(AB >= 50)
+```
+
+```{r}
+# Correlation between Avg Exit Velo and Slugging %
+cor.test(player_test$avg_ev, player_test$SLG)
+```
+
+Looking at my first EDA, I noticed that the vast majority of extra-base hits were clustered in areas with higher exit velocities. Since slugging percentage rewards extra-base damage more heavily than singles, I wanted to test whether exit velocity and slugging percentage were correlated. In order to make the analysis more reliable, I filtered the data to hitters with at least 50 at-bats. This helped focus the analysis on players who were consistently playing or receiving regular pinch-hit opportunities throughout the season, rather than players with extremely small sample sizes, such as someone with only a few at-bats spread across multiple months. The analysis showed a statistically significant positive correlation between average exit velocity and slugging percentage with R = .554 and p \< .001. This would suggest that hitters who are consistently producing higher exit velocities tend to generate more offensive production and extra-base damage over the course of a season, which aligns with what I saw from my first EDA.
+
+```{r}
+# Correlation between Avg Launch Angle and Slugging %
+
+cor.test(player_test$avg_la, player_test$SLG)
+```
+
+On top of looking at Exit Velocity , I also noticed that the XBH tended to cluster within a launch angle range of around 20-30 degrees. This also made me curious on whether or not Launch angle was correlated with Slugging percentage. Similarly to last correlation test, I filtered the hitters to have at least 50 ABs on the season for consistency. This test also shows a statistically significant positive correlation between average launch angle and slugging percentage with r = .401 and p \< .001. This suggests that launch angle plays an important role in offensive success, as hitters producing batted balls within more optimal launch angle ranges tend to generate higher slugging percentages. That being said, the relationship was not as strong as the correlation between exit velocity and slugging percentage, telling us while launch angle is important, exit velocity may be playing a larger role in offensive success.
+
+```{r}
+# Anova test by Pitch Type / Zone
+strikezone_anova <- pitch_buckets |>
+    filter(!is.na(PlateLocSide), !is.na(PlateLocHeight), 
+           PlayResult %in% c(
+             "Single", "Double", "Triple", "HomeRun", "Out", "Error", "FieldersChoice")) |>
+    mutate(
+      ZoneRegion = case_when(
+        PlateLocHeight > 3.5 ~ "Up Out of Zone",
+        PlateLocHeight < 1.5 ~ "Down Out of Zone",
+        PlateLocSide < -.708 ~ "Left Out of Zone", 
+        PlateLocSide > .708 ~  "Right Out of Zone", 
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Up Left",
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Up Middle",
+        
+        PlateLocHeight >= 2.83 & PlateLocHeight <= 3.5 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Up Right",
+        
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Middle Left",
+      
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Middle Middle",
+      
+        PlateLocHeight >= 2.17 & PlateLocHeight < 2.83 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Middle Right",
+        
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide >= -0.708 & PlateLocSide <= -0.236 ~ "Down Left",
+      
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide > -0.236 & PlateLocSide <= 0.236 ~ "Down Middle",
+      
+        PlateLocHeight >= 1.5 & PlateLocHeight < 2.17 &
+        PlateLocSide > 0.236 & PlateLocSide <= 0.708 ~ "Down Right"), 
+      
+      TotalBases = case_when(
+      PlayResult == "Single" ~ 1,
+      PlayResult == "Double" ~ 2,
+      PlayResult == "Triple" ~ 3,
+      PlayResult == "HomeRun" ~ 4,
+      TRUE ~ 0))
+
+anova.test <- aov(TotalBases ~ PitchGroup * ZoneRegion, data = strikezone_anova)
+summary(anova.test)
+```
+
+### Random Forest
+#### Expected Contact Value
+```{r}
+# Keep balls in play that count as official at-bats
+# Prepare balls in play that count as official at-bats
+contact_data <- acc_game_data |>
+  filter(PitchCall == "InPlay",
+    !is.na(ExitSpeed),
+    !is.na(Angle),
+    !is.na(Direction),
+    PlayResult %in% c(
+      "Out", "Single", "Double", "Triple",
+      "HomeRun", "Error", "FieldersChoice")) |>
+  mutate(TotalBases = case_when(
+      PlayResult == "Single" ~ 1,
+      PlayResult == "Double" ~ 2,
+      PlayResult == "Triple" ~ 3,
+      PlayResult == "HomeRun" ~ 4,
+      TRUE ~ 0), TotalBases = factor(TotalBases))
+set.seed(123)
+
+contact_train_rows <- sample(
+  seq_len(nrow(contact_data)),
+  size = floor(0.80 * nrow(contact_data)))
+
+contact_train <- contact_data[contact_train_rows, ]
+contact_test  <- contact_data[-contact_train_rows, ]
+
+rf_contact_value <- randomForest(TotalBases ~
+    ExitSpeed +
+    Angle +
+    Direction +
+    PlateLocSide +
+    PlateLocHeight +
+    TaggedPitchType +
+    BatterSide +
+    PitcherThrows +
+    Balls +
+    Strikes,
+  data = contact_train,
+  ntree = 1000,
+  importance = TRUE)
+
+print(rf_contact_value)
+varImpPlot(rf_contact_value)
+```
+
+```{r}
+contact_test_predictions <- predict(rf_contact_value, newdata = contact_test)
+
+contact_confusion_matrix <- table(
+  Actual = contact_test$TotalBases,
+  Predicted = contact_test_predictions)
+
+contact_accuracy <- mean(contact_test_predictions == contact_test$TotalBases)
+
+contact_confusion_matrix
+contact_accuracy
+```
+
+```{r}
+contact_probabilities <- predict(rf_contact_value,
+  newdata = contact_data,
+  type = "prob")
+
+contact_data <- contact_data |>
+  mutate(xHit_on_contact = rowSums(
+      contact_probabilities[, c("1", "2", "3", "4")]),
+    xTB_on_contact =
+      contact_probabilities[, "1"] +
+      2 * contact_probabilities[, "2"] +
+      3 * contact_probabilities[, "3"] +
+      4 * contact_probabilities[, "4"])
+
+expected_contact <- contact_data |>
+  group_by(Batter) |>
+  summarise(BIP = n(),
+    xBA_contact = mean(xHit_on_contact),
+    xSLG_contact = mean(xTB_on_contact),
+    .groups = "drop")
+```
+
+#### Expected Plate Discipline
+```{r}
+plate_discipline <- acc_game_data |>
+  group_by(Batter) |>
+  summarise(
+    BB = sum(KorBB == "Walk", na.rm = TRUE),
+    K  = sum(KorBB == "Strikeout", na.rm = TRUE),
+    HBP = sum(PitchCall == "HitByPitch", na.rm = TRUE),
+    SF = sum(
+      PlayResult == "Sacrifice" &
+      TaggedHitType != "Bunt",
+      na.rm = TRUE),
+  .groups = "drop")
+```
+
+
+```{r}
+pa_data <- acc_game_data |>
+  filter(
+    KorBB %in% c("Walk", "Strikeout") |
+    PitchCall == "HitByPitch" |
+    PlayResult %in% c("Out", "Single", "Double", "Triple",
+      "HomeRun", "Error", "FieldersChoice")) |>
+  mutate(PA_Result = case_when(
+      KorBB == "Walk" ~ "BB",
+      KorBB == "Strikeout" ~ "K",
+      PitchCall == "HitByPitch" ~ "HBP",
+      TRUE ~ "Contact"),
+    PA_Result = factor(PA_Result))
+discipline_data <- pa_data |>
+  select(Batter, PA_Result, PlateLocSide, PlateLocHeight, TaggedPitchType, RelSpeed,
+    HorzBreak, InducedVertBreak, BatterSide, PitcherThrows, Balls,Strikes) |>
+  drop_na() |>
+  filter(TaggedPitchType != "Undefined",
+    BatterSide != "Undefined",
+    PitcherThrows != "Undefined")
+
+set.seed(123)
+train_rows <- sample(
+  seq_len(nrow(discipline_data)),
+  size = 0.80 * nrow(discipline_data))
+pa_train <- discipline_data[train_rows, ]
+pa_test <- discipline_data[-train_rows, ]
+rf_discipline <- randomForest(
+  PA_Result ~
+    PlateLocSide +
+    PlateLocHeight +
+    TaggedPitchType +
+    RelSpeed +
+    HorzBreak +
+    InducedVertBreak +
+    BatterSide +
+    PitcherThrows +
+    Balls +
+    Strikes,
+  data = pa_train,
+  ntree = 1000,
+  importance = TRUE)
+print(rf_discipline)
+varImpPlot(rf_discipline)
+```
+
+```{r}
+# Test Set Eval 
+discipline_test_pred <- predict(
+  rf_discipline,
+  newdata = pa_test)
+table(Actual = pa_test$PA_Result,
+  Predicted = discipline_test_pred)
+
+mean(discipline_test_pred == pa_test$PA_Result)
+```
+```{r}
+# Season Probabilities 
+discipline_probs <- predict(
+  rf_discipline,
+  newdata = discipline_data,
+  type = "prob")
+discipline_data <- discipline_data |>
+  mutate(xBB = discipline_probs[, "BB"],
+    xContact = discipline_probs[, "Contact"],
+    xHBP = discipline_probs[, "HBP"],
+    xK = discipline_probs[, "K"])
+expected_discipline <- discipline_data |>
+  group_by(Batter) |>
+  summarise(Model_PA = n(),
+    xBB = sum(xBB),
+    xK = sum(xK),
+    xHBP = sum(xHBP),
+    xContact = sum(xContact),
+    .groups = "drop")
+```
+
+```{r}
+player_xops <- expected_discipline |>
+  left_join(expected_contact, by = "Batter") |>
+  left_join(plate_discipline |> 
+            select(Batter, SF), by = "Batter") |>
+  mutate(
+    xH = xBA_contact * xContact,
+    xTB = xSLG_contact * xContact,
+    # Expected at-bats consist of expected contact plus expected strikeouts
+    xAB = xContact + xK, 
+    xOBP = (xH + xBB + xHBP) / (xAB + xBB + xHBP + SF),
+    xSLG = xTB / xAB,
+    xOPS = xOBP + xSLG) |>
+  arrange(desc(xOPS))
+```
+
+```{r}
+## Actual OPS to compare vs Expected
+player_ops <- acc_game_data |>
+  group_by(Batter) |>
+  summarise(AB = sum(PlayResult %in% c("Out",
+        "Single","Double","Triple","HomeRun",
+        "Error","FieldersChoice"),na.rm = TRUE) +
+      sum(KorBB == "Strikeout", na.rm = TRUE),
+    H = sum(PlayResult %in% c("Single", "Double",
+        "Triple", "HomeRun"),na.rm = TRUE),
+    BB = sum(KorBB == "Walk", na.rm = TRUE),
+    HBP = sum(PitchCall == "HitByPitch", na.rm = TRUE),
+    SF = sum(PlayResult == "Sacrifice" & TaggedHitType != "Bunt",
+      na.rm = TRUE),
+    TB = sum(case_when(
+        PlayResult == "Single" ~ 1,
+        PlayResult == "Double" ~ 2,
+        PlayResult == "Triple" ~ 3,
+        PlayResult == "HomeRun" ~ 4,
+        TRUE ~ 0)),
+    .groups = "drop") |>
+  mutate(BA = H / AB,
+    OBP = (H + BB + HBP) /
+      (AB + BB + HBP + SF),
+    SLG = TB / AB,
+    OPS = OBP + SLG,
+    PA = AB + BB + HBP + SF)
+```
+
+```{r}
+player_compare <- player_xops |>
+  inner_join(player_ops |>
+      select(Batter, PA, OPS, OBP, SLG, BA),by = "Batter") |>
+  filter(PA >= 50)
+cor.test(player_compare$OPS, player_compare$xOPS)
+
+xOPS_vs_OPS_plot <- player_compare |>
+  ggplot(aes(x = xOPS, y = OPS)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Actual OPS vs Expected OPS", x = "Expected OPS", y = "Actual OPS")
+xOPS_vs_OPS_plot
+```
+The Pearson correlation between OPS and xOPS was 0.931, showing a very strong positive relationship between actual offensive production and expected offensive production. This means that players with higher OPS generally also had higher xOPS. The relationship was statistically significant, t(224) = 38.06, p < 0.001, with a 95% confidence interval from 0.911 to 0.946. Overall, this suggests that the xOPS model is closely aligned with actual OPS, while still leaving room to examine players who overperformed or underperformed their expected results.
+
+The Actual vs Expected OPS plot shows the relationship between actual OPS and expected OPS (xOPS) for ACC hitters. There is a strong positive linear relationship between the two metrics, with a Pearson correlation of r = 0.931 (p < 0.001). Most players cluster closely around the 45 Degree Line, indicating that the xOPS model captures a large portion of the variation in offensive performance. However, several players fall noticeably above or below the line, suggesting that some hitters either outperformed or underperformed their expected production. These deviations may reflect factors not fully captured by the model, such as luck, situational hitting, baserunning value, or other offensive skills.
+
+#### Overperformers and Underperformers
+```{r}
+player_compare <- player_compare |>
+  mutate(OPS_Diff = OPS - xOPS)
+
+OPS_overperformers <- player_compare |>
+  arrange(desc(OPS_Diff)) |>
+  select(Batter, PA, OPS, xOPS, OPS_Diff) |>
+  head(10)
+overperform_table <- kable(OPS_overperformers, digits = 3,
+  col.names = c("Batter", "Plate Appearances", "Actual OPS", "Expected OPS", "OPS Difference"),
+  caption = "Top 10 OPS Overperformers")
+overperform_table
+
+OPS_underperformers <- player_compare |>
+  arrange(OPS_Diff) |>
+  select(Batter, PA, OPS, xOPS, OPS_Diff) |>
+  head(10)
+underperform_table <- kable(OPS_underperformers, digits = 3, 
+  col.names = c("Batter", "Plate Appearances", "Actual OPS", "Expected OPS", "OPS Difference"),
+  caption = "Top 10 OPS Underperformers")
+underperform_table
+```
