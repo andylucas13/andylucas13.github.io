@@ -1,0 +1,374 @@
+---
+title: "Bryan Rincon: Breaking Down the Breakout"
+subtitle: "Swing changes, offensive growth, and the case for an everyday shortstop"
+author: "Andy Lucas"
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+## Does the Bat Make Him an Everyday Shortstop?
+
+After watching Rincon live against Altoona on June 23 and on video
+throughout 2026, I see the actions, range, and arm versatility to stay
+at shortstop. His fielding percentage dropped as his workload increased,
+so consistency deserves another look, but the tools are there.
+
+The bigger question is the bat. Rincon showed more power, 
+a lower strikeout rate, and more walks in Double A. Do those gains make him a future
+everyday shortstop? I’ll look at his production and swing changes to
+assess what looks sustainable and what still needs to hold up against
+better pitching.
+
+## Recommendation and Confidence
+
+I would raise Rincon’s offensive projection toward an everyday shortstop outcome, with moderate confidence in the bat. The strongest evidence is increased game power alongside lower strikeout frequency and sustained walk production.
+
+```{r}
+library(baseballr)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(plotly)
+```
+
+```{r}
+rincon_2025 <- readRDS("data/raw/rincon_2025.rds")
+rincon_2026 <- readRDS("data/raw/rincon_2026.rds")
+```
+
+```{r}
+# Combine the seasons and calculate rates from the original counts
+rincon_comparison <- bind_rows(rincon_2025, rincon_2026) |>
+  mutate(k_pct = 100 * strike_outs / plate_appearances,
+    bb_pct = 100 * base_on_balls / plate_appearances,
+    hr_pct = 100 * home_runs / plate_appearances,
+    iso = (total_bases - hits) / at_bats,
+    babip_calc = (hits - home_runs) /
+      (at_bats - strike_outs - home_runs + sac_flies)) |>
+  select(
+    season, sport_abbreviation, plate_appearances,
+    k_pct, bb_pct, hr_pct, iso, babip_calc, ops)
+
+rincon_comparison |>
+  as.data.frame() |>
+  knitr::kable(
+    format = "html",
+    caption = "Bryan Rincon: 2025–2026 Offensive Performance",
+    col.names = c(
+      "Season", "Level", "PA", "K%", "BB%",
+      "HR/PA (%)", "ISO", "BABIP", "OPS"),
+    digits = c(0, 0, 0, 1, 1, 1, 3, 3, 3),
+    row.names = FALSE,
+    align = c("l", "l", rep("r", 7))) |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 16) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#002D62") |>
+  kableExtra::row_spec(
+    2,
+    bold = TRUE,
+    color = "#B52832",
+    background = "#FFF1F2")
+```
+
+Rincon showed more game power while lowering his strikout rate and drawing
+more walks. His strikeout rate fell from 28.7% to 20.8%, his walk rate
+climbed from 13.9% to 17.8%, and his ISO increased from .117 to .250.
+The combination is more encouraging than the power jump alone: he
+produced substantially more damage without an increase in strikeout
+frequency. His BABIP also rose from .250 to .299, so improved results on
+balls in play contributed to the breakout. The move from High A to
+Double A and the change in playing environment remain important context.
+
+## Did the Improvements Hold Throughout 2026?
+
+To determine whether the breakout extended beyond a hot stretch, I
+examined his strikeout, walk, and home run rates by month. Each month is
+compared with his 2025 season rates, with plate appearances shown to
+give the results proper sample context.
+
+```{r}
+# Load the saved game logs
+game_log_response <- jsonlite::fromJSON(
+  "data/raw/rincon_2026_game_logs.json",
+  flatten = TRUE)
+
+rincon_games <- game_log_response$stats$splits[[1]]
+
+# Label each game by its date
+monthly_comparison <- rincon_games |>
+  mutate(
+    date = as.Date(date),
+    month = format(date, "%Y-%m")) |>
+  group_by(month) |>
+  summarise(
+    PA = sum(stat.plateAppearances),
+    AB = sum(stat.atBats),
+    H = sum(stat.hits),
+    TB = sum(stat.totalBases),
+    SO = sum(stat.strikeOuts),
+    BB = sum(stat.baseOnBalls),
+    HR = sum(stat.homeRuns),
+    .groups = "drop") |>
+  mutate(
+    k_pct = 100 * SO / PA,
+    bb_pct = 100 * BB / PA,
+    hr_pct = 100 * HR / PA,
+    iso = (TB - H) / AB) |>
+  arrange(month)
+```
+Navy lines show his 2026 monthly rates. Red dashed lines show
+his 2025 season rates. Hover over a dot for the percentage
+and plate appearances.
+```{r}
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4.5
+
+# Put the monthly rates into plotting format
+monthly_chart_data <- monthly_comparison |>
+  mutate(
+    month_label = paste0(
+      format(as.Date(paste0(month, "-01")), "%b"),
+      "\n", PA, " PA"),
+    month_label = factor(month_label, levels = month_label)) |>
+  tidyr::pivot_longer(
+    cols = c(k_pct, bb_pct, hr_pct),
+    names_to = "metric",
+    values_to = "rate")
+# Use the 2025 season rates as reference lines
+reference_2025 <- rincon_comparison |>
+  as.data.frame() |>
+  filter(season == "2025") |>
+  select(k_pct, bb_pct, hr_pct) |>
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "rate")
+metric_order <- c("k_pct", "bb_pct", "hr_pct")
+
+monthly_chart_data <- monthly_chart_data |>
+  mutate(metric = factor(metric, levels = metric_order))
+
+reference_2025 <- reference_2025 |>
+  mutate(metric = factor(metric, levels = metric_order))
+
+monthly_plot <- ggplot2::ggplot(
+  monthly_chart_data,
+  ggplot2::aes(x = month_label, y = rate, group = 1)) +
+  ggplot2::geom_hline(
+    data = reference_2025,
+    ggplot2::aes(yintercept = rate),
+    color = "#B52832",
+    linetype = "dashed") +
+  ggplot2::geom_line(color = "#002D62", linewidth = 1) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      text = paste0(
+        "Month: ", month,
+        "\nPA: ", PA,
+        "\nRate: ", sprintf("%.1f%%", rate))),
+    color = "#002D62",
+    size = 2.5) +
+  ggplot2::facet_wrap(
+    ~metric,
+    nrow = 1,
+    labeller = ggplot2::as_labeller(c(
+      k_pct = "Strikeout rate",
+      bb_pct = "Walk rate",
+      hr_pct = "Home run rate"))) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 35),
+    labels = function(x) paste0(x, "%")) +
+  ggplot2::labs(
+    title = "Rincon’s Offensive Performance by Month",
+    subtitle = "Navy: 2026 Double-A monthly rates | Red dashed: 2025 High-A season rates",
+    x = NULL,
+    y = "Percentage of plate appearances",
+    caption = "Source: MLB Stats API. Different levels and environments limit comparisons.") +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold"))
+plotly::ggplotly(monthly_plot, tooltip = "text")
+```
+
+Rincon’s lower strikeout frequency and higher home run frequency
+persisted across every month of 2026 relative to his 2025 season rates.
+His walk rate increased each month after May. May paired a comparatively
+lower walk rate (11.8%) with a higher home run rate (7.1%), raising the
+possibility of a more aggressive approach; however, swing rates, count
+data, or video would be needed to test that explanation. Overall, the
+improvement was not confined to one hot month, although smaller monthly
+samples, particularly September’s 49 plate appearances, and different
+playing environments limit the comparison.
+
+## Mechanical Look: Bat Setup and Timing
+
+### Changes from 2024 through 2026
+
+In the 2024 footage I reviewed, Rincon started with a flatter barrel
+near his shoulder. From the left side, the bat appeared to rest on the
+shoulder; from the right side, it hovered above it. He then brought the
+barrel into a more upright position during his load.
+
+By 2025, his starting bat position looked much closer to the 2026 setup.
+The difference in the selected clips was more subtle: I observed more
+hand movement during his 2025 load, while the 2026 move appeared
+quieter.
+
+The progression looks like a gradual refinement rather than a complete
+overhaul in one offseason. The larger change in barrel orientation
+appears between the 2024 footage and the later clips, with further
+reduction in hand movement visible in the selected 2026 swings. Matching
+the stage of the delivery and reviewing additional plate appearances
+would help confirm how consistently those differences appear.
+
+### Reported Work with Kevin Long
+
+The article attributed to NBC Sports Philadelphia adds a specific
+developmental adjustment to the video observations. Rincon described
+getting too handsy and allowing his swing to get long when trying to
+correct it. During spring training in 2026, Kevin Long introduced a
+drill using the cue of taking the knob toward the baseball to simplify
+his hand path.
+
+This gives context to the work on his swing, but the article does not
+identify the more upright starting barrel as an instruction from Long.
+Rincon also credited getting stronger and gaining confidence. His return
+from the hamate injury provides additional context, although the
+available evidence cannot separate the effects of health, strength, and
+mechanical changes.
+
+### Potential Effect on the Swing
+
+My read is that the offseason between 2025 and 2026 gave Rincon time to
+settle into the more upright barrel position already visible in his 2025
+setup. As he recovered, gained strength, and worked on his hand path, he
+may have become more comfortable with that position and reduced the
+extra hand movement during his load. The selected 2026 swings appear
+quieter into launch, which could help him repeat his timing and deliver
+the barrel more consistently. This is my interpretation of the video
+progression, supported by the reported strength and hand path work,
+rather than a confirmed explanation of how the adjustment developed.
+
+The statistical results support taking that possibility seriously. He
+produced more damage while striking out less often. However, the lower
+strikeout rate does not establish improved contact on swings, and the
+selected footage cannot confirm a shorter swing or better plate
+coverage. Those remain priorities for the next video review.
+
+### What I Would Look for Next
+
+The next look would focus on whether the setup produces a more
+repeatable move into launch. I would compare his hands and barrel at the
+same checkpoints in the delivery, particularly pitcher release and front
+foot plant, using multiple plate appearances from each side.
+
+I would include swings against velocity and breaking balls, along with
+takes, fouls, and misses. The key question is whether the adjustment
+helps him get the barrel to different locations and adjust to changes in
+speed. The selected highlights suggest a setup change, but they do not
+yet establish improved plate coverage or a shorter swing.
+
+## Updated Projection
+
+I would raise Rincon’s offensive projection and give greater weight to
+an everyday major league shortstop outcome, with moderate confidence in
+the bat. The combination of more game power, fewer strikeouts per plate
+appearance, and a higher walk rate makes this a meaningful step forward.
+Those gains also extended beyond one hot stretch.
+
+My live look against Altoona on June 23, 2026, combined with video
+review throughout the season, gives me confidence that he can stay at
+shortstop. He shows smooth actions approaching the ball, covers ground,
+and makes throws from different arm slots and body positions. His speed
+also contributes on the bases. That foundation gives him a path to an
+everyday role without requiring the bat to carry his entire profile.
+
+The decline in fielding percentage deserves attention alongside
+his increased workload, but the defensive tools still look
+intact. More innings do not explain the rate decline on their
+own. I would review the errors for patterns in routine execution
+and throwing accuracy. For now, I view consistency as an area
+to monitor rather than a reason to move him off shortstop.
+
+The remaining uncertainty is how much offense will translate against
+better pitching. His quieter load and reported work on the hand path
+offer a plausible explanation for the gains, but the next test is
+whether he maintains his timing against velocity and adjusts to breaking
+balls from both sides of the plate. I see a stronger case for an
+everyday shortstop than I did before the breakout, while leaving the
+offensive ceiling open until he faces more advanced competition.
+
+## Limitations
+
+Access to 2024 and 2025 footage was very limited. Those clips provide
+reference points, but they do not establish how consistently Rincon used
+each setup or exactly when adjustments occurred. Differences in camera
+angle and the stage of the delivery also affect comparisons of his hands
+and barrel.
+
+Most of the available 2026 clips reviewed were highlights of home runs
+or other extra base hits. This creates a sample weighted toward his best
+swings and outcomes. It is useful for examining how his swing looks when
+he does damage, but cannot establish how often he repeats those
+movements, handles difficult pitches, or makes contact. A fuller review
+would include takes, fouls, misses, and unsuccessful plate appearances
+from both sides.
+
+The statistical comparison spans different levels and playing
+environments without adjustments for league or park effects. Monthly
+samples are smaller than season samples, particularly September’s 49
+plate appearances. Lower strikeout frequency does not by itself
+establish improved contact rate or pitch recognition.
+
+The connections drawn between his setup, hand path work, physical
+development, and offensive results are scouting interpretations rather
+than demonstrated causes. Similarly, fielding percentage does not
+measure his full defensive value or establish why his error rate
+changed. The role projection combines the available statistics,
+reporting, and my live and video observations, with further evaluation
+needed against more advanced competition.
+
+<details>
+
+<summary>Sources and Scouting Looks</summary>
+
+#### Statistical Sources
+
+- **MLB Stats API via baseballr:** 2025 High A and 2026 Double A regular season batting totals. The 2026 game logs were downloaded directly from the API. Retrieved October 1, 2026. Original inputs are preserved in `data/raw`.
+
+- **Calculations in R:** Strikeout rate, walk rate, home run rate, ISO, BABIP, and monthly comparisons were calculated from the underlying counts. Game log totals were checked against the 2026 season totals.
+
+- **[MiLB: Bryan Rincon career fielding statistics](https://www.milb.com/player/bryan-rincon-804858?stats=career-r-fielding-minors&year=2026):** Shortstop appearances, innings, errors, and fielding percentage used to contextualize his defensive workload and results. Fielding percentage is reported directly by MiLB. Accessed October 1, 2026.
+
+#### Video Sources
+
+- **[MLB Film Room: Bryan Rincon](https://www.mlb.com/video/?q=bryan+rincon&qt=FREETEXT):** Selected footage used to examine his setup, barrel orientation, and load across seasons and from both sides of the plate. Accessed October 1, 2026.
+
+- **[Jersey Shore BlueClaws and Bryan Rincon Instagram post](https://www.instagram.com/p/DJ5U0aFOBj6/?img_index=2):** Posted May 20, 2025. The second carousel item was used to examine his setup and load from the left side. Accessed October 1, 2026.
+
+#### Reporting
+
+- **[MLB: Phillies prospect Bryan Rincon’s breakout season at Double A](https://www.mlb.com/amp/news/phillies-prospect-bryan-rincon-breakout-season-double-a.html):** Background on his offensive development and prior injuries.
+
+- **[Rising shortstop prospect soaks up CBP, earns Phillies’ top minors honor](https://sports.yahoo.com/articles/rising-shortstop-prospect-soaks-cbp-172000939.html):** NBC Sports Philadelphia article republished by Yahoo Sports. Used for Rincon’s comments about working with Kevin Long, the hand path drill, strength gains, and confidence.
+
+#### Personal Scouting Looks
+
+- Live look against Altoona on June 23, 2026, supplemented by video review throughout the season. Observations of his defensive actions, throwing versatility, and speed, along with the projection that he can remain at shortstop, are my own evaluations.
+
+</details>
