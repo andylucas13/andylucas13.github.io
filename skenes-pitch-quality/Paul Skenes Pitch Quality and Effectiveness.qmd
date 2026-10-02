@@ -1,0 +1,1733 @@
+---
+title: "Paul Skenes: Pitch Quality and Effectiveness"
+subtitle: "An exploratory study of arsenal changes, release characteristics, and secondary-pitch chase"
+author: "Andy Lucas"
+lang: en
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-title: "In this analysis"
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show R code"
+    code-tools: true
+    code-copy: true
+    embed-resources: true
+    link-external-newwindow: true
+    include-in-header:
+      text: |
+        <style>
+        :root { --bs-link-color: #805c00; }
+        .quarto-title-block { border-bottom: 3px solid #c58b00; padding-bottom: 1rem; }
+        h2 { margin-top: 2.3rem; }
+        h3 { margin-top: 1.7rem; }
+        p { line-height: 1.65; }
+        table { font-variant-numeric: tabular-nums; }
+        .table-responsive { margin: 1rem 0 1.4rem; }
+        caption { color: #333; font-weight: 600; }
+        details { margin: .8rem 0; }
+        details > summary { color: #666; font-size: .9rem; }
+        .cell-output-display { overflow-x: auto; }
+        </style>
+execute:
+  echo: true
+  message: false
+  warning: true
+  error: false
+editor:
+  markdown:
+    wrap: sentence
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(baseballr)
+library(kableExtra)
+library(randomForest)
+# Namespace-qualified calls below require sandwich.
+stopifnot(requireNamespace("sandwich", quietly = TRUE))
+```
+
+## Executive Summary
+
+Skenes's sampled 2026 results showed lower strikeout rates, higher walk rates, and more home runs than in 2025.
+The four-seamer accounted for most of the additional home runs, while the changeup and sweeper showed reduced chase and whiff rates.
+Release characteristics added predictive information about fastball velocity and movement in some test periods, but the improvement was inconsistent.
+A separate analysis found no clear, stable association between recent fastball velocity and secondary-pitch chase.
+The results identify several accompanying changes without establishing one definitive cause of the decline.
+
+::: {.callout-note title="Scope"}
+This is an exploratory analysis of regular-season data requested through **September 22, 2026**, compared with his full 2024 and 2025 regular seasons.
+The 2026 sample is near-complete and potentially excludes one remaining start; the reported results are those available through the cutoff.
+:::
+
+## Research Questions and Working Hypotheses
+
+The project asks what changed in Skenes's pitch quality and results, and whether delivery measurements or fastball expectations help explain those changes.
+Two working hypotheses guide the modeling:
+
+1.  **Delivery and fastball shape:** Changes in release position, extension, or arm angle may be associated with changes in four-seam velocity and induced vertical break.
+2.  **Fastball expectations and chase:** Hitters preparing for a faster fastball may commit earlier, leaving them more susceptible to chasing secondary pitches outside the strike zone.
+
+The second hypothesis concerns anticipation across encounters, not only the immediately preceding pitch.
+Pitchers may shape hitter expectations over multiple games; however, this dataset cannot establish deliberate long-term setup or directly observe a hitter's decision process.
+These hypotheses developed during the analysis and are treated as exploratory explanations, not preregistered causal tests.
+
+## Data and Methods
+
+Pitch-level Statcast data were requested through `baseballr` for Skenes (MLBAM ID 694973).
+The requested windows are May 11–September 30, 2024; March 27–September 28, 2025; and March 26–September 22, 2026.
+Only regular-season records are retained.
+Duplicate pitch identifiers are removed, and cumulative outing pitch count is calculated before separating pitch types.
+The original workload groups are retained in the code for reproducibility, although the final article emphasizes seasonal comparisons.
+
+The download chunk saves a timestamped RDS snapshot on its first run and reuses it on subsequent renders.
+The current snapshot preserves the original extraction and adds the remaining September 2024 and 2025 pitches downloaded after the end-date update.
+A fresh extraction may contain later Statcast revisions.
+
+```{r}
+#| label: download-and-save-snapshot
+# To refresh deliberately, change this filename or archive the existing snapshot.
+data_dir <- "data"
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+snapshot_path <- file.path(data_dir, "skenes-full-2024-2025-through-2026-09-22.rds")
+
+if (file.exists(snapshot_path)) {
+  data_snapshot <- readRDS(snapshot_path)
+  skenes <- data_snapshot$pitches
+  extraction_time <- data_snapshot$extracted_at
+  # Preserve the original per-season objects as well.
+  skenes_2024 <- skenes |> filter(game_year == 2024)
+  skenes_2025 <- skenes |> filter(game_year == 2025)
+  skenes_2026 <- skenes |> filter(game_year == 2026)
+} else {
+  skenes_2024 <- statcast_search_pitchers(
+    start_date = "2024-05-11",
+    end_date = "2024-09-30",
+    pitcherid = 694973)
+  
+  skenes_2025 <- statcast_search_pitchers(
+    start_date = "2025-03-27",
+    end_date = "2025-09-28",
+    pitcherid = 694973)
+  
+  skenes_2026 <- statcast_search_pitchers(
+    start_date = "2026-03-26",
+    end_date = "2026-09-22",
+    pitcherid = 694973)
+  
+  skenes <- bind_rows(skenes_2024, skenes_2025, skenes_2026)
+  stopifnot(all(2024:2026 %in% unique(skenes$game_year)))
+  extraction_time <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+  saveRDS(list(pitches = skenes, extracted_at = extraction_time), snapshot_path)
+}
+stopifnot(all(2024:2026 %in% unique(skenes$game_year)))
+```
+
+```{r}
+#| label: clean-and-derive-metrics
+skenes_clean <- skenes |>
+  filter(game_type == "R",
+    !is.na(at_bat_number),
+    !is.na(pitch_number)) |>
+  distinct(
+    game_pk, at_bat_number, pitch_number,
+    .keep_all = TRUE) |>
+  arrange(game_pk, at_bat_number, pitch_number) |>
+  group_by(game_pk) |>
+  mutate(
+    game_pitch_number = row_number(),
+    workload_group = case_when(
+      game_pitch_number <= 25 ~ "1-25",
+      game_pitch_number <= 50 ~ "26-50",
+      game_pitch_number <= 75 ~ "51-75",
+      TRUE ~ "76+")) |>
+  ungroup() |>
+  mutate(
+    season = factor(game_year),
+    workload_group = factor(
+      workload_group,
+      levels = c("1-25", "26-50", "51-75", "76+")))
+
+# Identify swings, misses, and measured locations.
+skenes_metrics <- skenes_clean |>
+  mutate(
+    swing = description %in% c(
+      "swinging_strike",
+      "swinging_strike_blocked",
+      "foul",
+      "foul_tip",
+      "hit_into_play",
+      "foul_bunt",
+      "missed_bunt",
+      "bunt_foul_tip"),
+
+    whiff = description %in% c(
+      "swinging_strike",
+      "swinging_strike_blocked",
+      "missed_bunt"),
+
+    # Keep missing locations as missing.
+    in_zone = case_when(
+      is.na(zone) ~ NA,
+      zone %in% 1:9 ~ TRUE,
+      TRUE ~ FALSE),
+
+    ball_in_play = description == "hit_into_play",
+
+    # Movement in inches, following your previous document.
+    induced_vertical_break = pfx_z * 12,
+    horizontal_break = pfx_x * 12)
+
+pitch_summary <- skenes_metrics |>
+  filter(!is.na(pitch_type), pitch_type != "") |>
+  group_by(season, pitch_type) |>
+  summarise(
+    pitches = n(),
+
+    avg_velo = mean(release_speed, na.rm = TRUE),
+    avg_spin = mean(release_spin_rate, na.rm = TRUE),
+
+    avg_IVB = mean(
+      induced_vertical_break, na.rm = TRUE),
+    avg_horizontal_break = mean(
+      horizontal_break, na.rm = TRUE),
+
+    zone_rate = 100 * mean(in_zone, na.rm = TRUE),
+
+    swings = sum(swing),
+    whiffs = sum(whiff),
+
+    outside_pitches = sum(!in_zone, na.rm = TRUE),
+    outside_swings = sum(swing & !in_zone, na.rm = TRUE),
+
+    measured_bip = sum(
+      ball_in_play & !is.na(launch_speed),
+      na.rm = TRUE),
+    
+    hard_hits = sum( ball_in_play & launch_speed >= 95, na.rm = TRUE),
+    .groups = "drop") |>
+  group_by(season) |>
+  mutate(
+    usage_rate = 100 * pitches / sum(pitches)) |>
+  ungroup() |>
+  mutate(
+    whiff_rate = if_else(
+      swings > 0, 100 * whiffs / swings, NA_real_),
+    chase_rate = if_else(
+      outside_pitches > 0, 100 * outside_swings / outside_pitches, NA_real_),
+    hard_hit_rate = if_else(
+      measured_bip > 0, 100 * hard_hits / measured_bip, NA_real_))
+```
+
+```{r}
+#| label: data-coverage
+skenes_clean |>
+  group_by(season) |>
+  summarise(pitches = n(), outings = n_distinct(game_pk),
+    first_date = min(as.Date(game_date)),
+    last_date = max(as.Date(game_date)), .groups = "drop") |>
+  knitr::kable(format = "html", digits = 0,
+    caption = "Regular-season sample coverage",
+    col.names = c("Season", "Pitches", "Outings", "First date", "Last date")) |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE, position = "center", font_size = 13) |>
+  kableExtra::row_spec(0, bold = TRUE, color = "black", background = "#F2C94C")
+```
+
+### Metric Definitions
+
+| Metric | Definition used here |
+|------------------------------------|------------------------------------|
+| Whiff rate | Swinging misses divided by swings; the retained swing definition includes bunt attempts. |
+| Chase rate | Swings at pitches outside Statcast zones 1–9 divided by pitches outside those zones. Missing zones are excluded. |
+| Hard-hit rate | Batted balls with exit velocity at least 95 mph divided by batted balls with available exit velocity. |
+| IVB | `pfx_z × 12`, expressed as induced vertical break in inches. |
+| Horizontal break | `pfx_x × 12`, signed from the catcher's perspective. |
+| Barrel rate | Statcast contact category 6 divided by batted balls with valid contact categories 1–6. |
+| K%, BB%, HR% | Recorded completed plate-appearance outcomes divided by recorded completed plate appearances; walks include intentional walks and truncated plate appearances are excluded. |
+
+These denominators differ: whiff rate is conditional on swinging, while hard-hit and barrel rates are conditional on contact.
+Zone rate and pitch location describe where a ball went, not whether it hit the intended target.
+The [Statcast field documentation](https://baseballsavant.mlb.com/csv-docs) also describes changes to plate-location references and strike-zone definitions in 2026; cross-season location comparisons require caution.
+
+## How Did Performance Change?
+
+### Overall Results
+
+I first establish how results changed using strikeout, walk, and home-run rates.
+These complementary measures distinguish reduced strikeout production from walks and damaging contact; they are not interchangeable with an overall run-prevention statistic.
+
+```{r}
+#| label: season-results
+pa_results <- skenes_clean |>
+  filter(
+    !is.na(events),
+    events != "",
+    events != "truncated_pa") |>
+  mutate(
+    strikeout = events %in% c(
+      "strikeout", "strikeout_double_play"),
+    walk = events %in% c("walk", "intent_walk"),
+    home_run = events == "home_run")
+
+season_results <- pa_results |>
+  group_by(season) |>
+  summarise(
+    plate_appearances = n(),
+    strikeouts = sum(strikeout),
+    walks = sum(walk),
+    home_runs = sum(home_run),
+    strikeout_rate = 100 * mean(strikeout),
+    walk_rate = 100 * mean(walk),
+    home_run_rate = 100 * mean(home_run),
+    .groups = "drop") |>
+  mutate(
+    k_minus_bb = strikeout_rate - walk_rate)
+
+season_results |>
+  select(season, plate_appearances, strikeouts, walks, home_runs,
+    strikeout_rate, walk_rate, k_minus_bb, home_run_rate) |>
+  knitr::kable(format = "html", digits = 2,
+    caption = "Plate-appearance results by season",
+    col.names = c("Season", "PA", "K", "BB", "HR", "K%", "BB%", "K−BB%", "HR%")) |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE, position = "center", font_size = 13) |>
+  kableExtra::row_spec(0, bold = TRUE, color = "black", background = "#F2C94C")
+```
+
+From 2025 to 2026, strikeout rate fell from 29.5% to 27.9%, walk rate increased from 5.73% to 6.82%, and home-run rate increased from 1.50% to 2.76% in the sampled periods.
+These changes establish the performance question; they do not identify its cause.
+
+### Arsenal Characteristics
+
+Comparing each pitch separately distinguishes changes within a pitch from changes in pitch selection.
+Pitch groups below are ordered by 2026 usage, with seasons presented chronologically.
+
+```{r}
+#| label: arsenal-table
+# Most-used pitches in 2026 first
+pitch_order <- pitch_summary |>
+  filter(season == "2026") |>
+  arrange(desc(usage_rate)) |>
+  pull(pitch_type)
+
+pitch_table <- pitch_summary |>
+  mutate(
+    pitch_name = recode(
+      pitch_type,
+      "CH" = "Changeup",
+      "CU" = "Curveball",
+      "FF" = "Four-Seam Fastball",
+      "FS" = "Splitter",
+      "SI" = "Sinker",
+      "SL" = "Slider",
+      "ST" = "Sweeper"),
+    pitch_order = match(pitch_type, pitch_order)) |>
+  arrange(pitch_order, season)
+
+# Preserve the same order for the table headings
+pitch_groups <- pitch_table |>
+  group_by(pitch_order, pitch_name) |>
+  summarise(rows = n(), .groups = "drop") |>
+  arrange(pitch_order) |>
+  select(pitch_name, rows) |>
+  deframe()
+pitch_table |>
+  select(
+    season, pitches, usage_rate,
+    avg_velo, avg_spin, avg_IVB, avg_horizontal_break,
+    zone_rate, whiff_rate, chase_rate, hard_hit_rate) |>
+  knitr::kable(
+    format = "html",
+    digits = 1,
+    col.names = c(
+      "Season", "Pitches", "Usage %",
+      "Velo (mph)", "Spin (rpm)", "IVB (in)",
+      "HB (in)", "Zone %", "Whiff %",
+      "Chase %", "Hard-hit %"),
+    caption = "Paul Skenes: Pitch Quality and Effectiveness by Season") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c(
+      "striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "gold") |>
+  kableExtra::pack_rows(
+    index = pitch_groups,
+    bold = TRUE,
+    background = "lightgrey")
+```
+
+```{r}
+#| label: prepare-arsenal-comparison
+# Select the six most-used pitches in 2026
+main_pitches <- pitch_table |>
+  filter(season == "2026") |>
+  slice_max(usage_rate, n = 6, with_ties = FALSE) |>
+  arrange(desc(usage_rate)) |>
+  pull(pitch_name)
+
+comparison_plot <- pitch_table |>
+  filter(
+    season %in% c("2025", "2026"),
+    pitch_name %in% main_pitches) |>
+  mutate(
+    pitch_name = factor(
+      pitch_name,
+      levels = main_pitches)) |>
+  select(
+    season, pitch_name,
+    avg_velo, avg_spin, avg_IVB,
+    whiff_rate, chase_rate, hard_hit_rate) |>
+  pivot_longer(
+    cols = c(
+      avg_velo, avg_spin, avg_IVB,
+      whiff_rate, chase_rate, hard_hit_rate),
+    names_to = "metric",
+    values_to = "value") |>
+  mutate(
+    metric = factor(
+      metric,
+      levels = c(
+        "avg_velo", "avg_spin", "avg_IVB",
+        "whiff_rate", "chase_rate", "hard_hit_rate"), 
+      labels = c(
+        "Velocity (mph)", "Spin (rpm)", "IVB (in)",
+        "Whiff rate (%)", "Chase rate (%)", "Hard-hit rate (%)")))
+```
+
+```{r}
+#| label: arsenal-comparison
+#| fig-alt: "Six panels compare 2025 and 2026 velocity, spin, IVB, whiff, chase, and hard-hit rates for six pitch types."
+#| fig-width: 11
+#| fig-height: 10
+#| out-width: "100%"
+
+ggplot(comparison_plot,
+  aes(x = value, y = forcats::fct_rev(pitch_name))) +
+  geom_line(
+    aes(group = pitch_name),
+    orientation = "y",
+    color = "gray60",
+    linewidth = 0.8) +
+  geom_point(
+    aes(color = season, shape = season),
+    size = 3) +
+  facet_wrap(
+    ~ metric,
+    scales = "free_x",
+    ncol = 2) +
+  scale_y_discrete(
+    labels = c(
+      "Four-Seam Fastball" = "Four-Seam",
+      "Sweeper" = "Sweeper",
+      "Changeup" = "Changeup",
+      "Sinker" = "Sinker",
+      "Splitter" = "Splitter",
+      "Slider" = "Slider")) +
+  scale_color_manual(
+    values = c(
+      "2025" = "darkred",
+      "2026" = "#C58B00")) +
+  scale_shape_manual(
+    values = c(
+      "2025" = 16,
+      "2026" = 17)) +
+  labs(
+    title = "How Did Skenes' Arsenal Change in 2026?",
+    subtitle = "Each line connects a pitch's 2025 and 2026 averages",
+    x = NULL,
+    y = NULL,
+    color = "Season",
+    shape = "Season",
+    caption = paste(
+      "Pitches ordered by 2026 usage.",
+      "Each panel uses its own measurement scale.")) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(
+      fill = "#F0F0F0",
+      color = "gray70"),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = grid::unit(1.2, "lines"),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(hjust = 0),
+    plot.margin = ggplot2::margin(12, 15, 12, 12))
+```
+
+The four-seamer slowed from 98.2 to 96.8 mph, but its own whiff and chase rates increased and its hard-hit rate decreased.
+That combination argues against describing the pitch as uniformly less effective.
+The changeup and sweeper, by contrast, both showed lower whiff and chase rates and higher hard-hit rates.
+The slider's hard-hit increase warrants caution because its contact sample is small.
+The near-disappearance of the curveball also limits its year-to-year comparison.
+
+### Contact Quality and Home Runs
+
+Which pitches accounted for the additional home runs, and did they also allow harder contact on average?
+Home runs per 100 pitches accounts descriptively for pitch usage; it is a different denominator from home runs per plate appearance.
+
+```{r}
+#| label: contact-quality
+
+contact_summary <- skenes_metrics |>
+  filter(!is.na(pitch_type), pitch_type != "") |>
+  group_by(season, pitch_type) |>
+  summarise(
+    pitches = n(),
+    home_runs = sum(events == "home_run", na.rm = TRUE),
+    batted_balls = sum(ball_in_play, na.rm = TRUE),
+
+    measured_bip = sum(
+      ball_in_play & !is.na(launch_speed),
+      na.rm = TRUE),
+
+    avg_exit_velocity = mean(
+      launch_speed[ball_in_play %in% TRUE],
+      na.rm = TRUE),
+
+    hard_hits = sum(
+      ball_in_play & launch_speed >= 95,
+      na.rm = TRUE),.groups = "drop") |>
+  mutate(
+    hard_hit_rate = if_else(
+      measured_bip > 0,
+      100 * hard_hits / measured_bip,
+      NA_real_),
+    hr_per_100_pitches = 100 * home_runs / pitches) |>
+  arrange(pitch_type, season)
+# Order pitches by 2026 usage
+contact_order <- contact_summary |>
+  filter(season == "2026") |>
+  arrange(desc(pitches)) |>
+  pull(pitch_type)
+
+contact_table <- contact_summary |>
+  mutate(
+    pitch_name = recode(
+      pitch_type,
+      "CH" = "Changeup",
+      "CU" = "Curveball",
+      "FF" = "Four-Seam Fastball",
+      "FS" = "Splitter",
+      "SI" = "Sinker",
+      "SL" = "Slider",
+      "ST" = "Sweeper"),
+    pitch_rank = match(pitch_type, contact_order)) |>
+  arrange(pitch_rank, season)
+
+contact_groups <- contact_table |>
+  group_by(pitch_rank, pitch_name) |>
+  summarise(rows = n(), .groups = "drop") |>
+  arrange(pitch_rank) |>
+  select(pitch_name, rows) |>
+  deframe()
+
+contact_table |>
+  select(
+    season,
+    pitches,
+    batted_balls,
+    home_runs,
+    avg_exit_velocity,
+    hard_hit_rate,
+    hr_per_100_pitches) |>
+  knitr::kable(
+    format = "html",
+    digits = c(0, 0, 0, 0, 1, 1, 2),
+    align = c("l", rep("c", 6)),
+    col.names = c(
+      "Season",
+      "Pitches",
+      "Batted Balls",
+      "HR",
+      "Avg. EV (mph)",
+      "Hard-hit %",
+      "HR / 100 Pitches"),
+    caption = "Paul Skenes: Contact Quality by Pitch") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c(
+      "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C") |>
+  kableExtra::row_spec(
+    which(as.character(contact_table$season) == "2026"),
+    bold = TRUE,
+    background = "#FFF5D6") |>
+  kableExtra::pack_rows(
+    index = contact_groups,
+    bold = TRUE,
+    background = "#EEEEEE") |>
+  kableExtra::footnote(
+    general = paste(
+      "Pitches ordered by 2026 usage.",
+      "Hard-hit = exit velocity of at least 95 mph.",
+      "Exit-velocity statistics exclude missing measurements."), general_title = "Note: ")
+```
+
+The four-seam fastball accounted for most of Skenes’s increased home-run total in the sampled periods.
+Despite similar pitch counts in 2025 and 2026, home runs increased from five to 12, while average exit velocity fell from 91.5 to 89.9 mph and hard-hit rate declined from 53.3% to 45.6%.
+This suggests that average contact measures do not fully capture the additional damage.
+The following analysis examines whether the increased home-run damage was accompanied by changes in batted-ball type and barrel rate.
+Comparisons for less-used pitches require caution because their batted-ball samples are small.
+
+```{r}
+#| label: four-seam-damage
+fastball_damage <- skenes_metrics |>
+  filter(
+    pitch_type == "FF",
+    ball_in_play %in% TRUE) |>
+  group_by(season) |>
+  summarise(
+    batted_balls = n(),
+
+    home_runs = sum(
+      events == "home_run",
+      na.rm = TRUE),
+
+    classified_batted_balls = sum(
+      bb_type %in% c(
+        "ground_ball", "line_drive", "fly_ball", "popup")),
+
+    ground_balls = sum(
+      bb_type == "ground_ball",
+      na.rm = TRUE),
+
+    fly_balls = sum(
+      bb_type == "fly_ball",
+      na.rm = TRUE),
+
+    barrel_eligible = sum(
+      launch_speed_angle %in% 1:6),
+
+    # Statcast contact category 6 = barrel
+    barrels = sum(
+      launch_speed_angle == 6,
+      na.rm = TRUE),
+
+    .groups = "drop") |>
+  mutate(
+    ground_ball_rate = if_else(
+      classified_batted_balls > 0,
+      100 * ground_balls / classified_batted_balls,
+      NA_real_),
+
+    fly_ball_rate = if_else(
+      classified_batted_balls > 0,
+      100 * fly_balls / classified_batted_balls,
+      NA_real_),
+
+    barrel_rate = if_else(
+      barrel_eligible > 0,
+      100 * barrels / barrel_eligible,
+      NA_real_),
+
+    hr_per_batted_ball = 100 * home_runs / batted_balls) |>
+  arrange(season)
+fastball_damage |>
+  select(
+    season,
+    batted_balls,
+    home_runs,
+    barrels,
+    ground_ball_rate,
+    fly_ball_rate,
+    barrel_rate,
+    hr_per_batted_ball) |>
+  knitr::kable(
+    format = "html",
+    digits = 1,
+    align = c("l", rep("c", 7)),
+    col.names = c(
+      "Season",
+      "Batted Balls",
+      "Home Runs",
+      "Barrels",
+      "Ground Ball %",
+      "Fly Ball %",
+      "Barrel %",
+      "HR / Batted Ball %"),
+    caption = "Four-Seam Fastball: Contact Quality by Season") |>
+  kableExtra::add_header_above(
+    c(" " = 1,
+      "Counts" = 3,
+      "Contact Rates" = 4)) |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 14) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C") |>
+  kableExtra::row_spec(
+    which(as.character(fastball_damage$season) == "2026"),
+    bold = TRUE,
+    background = "#FFF5D6")
+```
+
+**Note:** Ground-ball and fly-ball rates use classified batted balls; fly balls exclude popups.
+Barrel rate uses batted balls with a valid Statcast contact classification.
+HR rate uses all batted balls.
+
+Skenes’s four-seam home-run increase coincided with a higher barrel rate, but not a higher fly-ball rate.
+From 2025 to 2026, barrel rate increased from 7.8% to 9.9%, while home runs per batted ball rose from 3.0% to 7.0%.
+These results suggest that the additional damage was concentrated in a relatively small number of contacts.
+They do not establish whether reduced velocity, pitch location, opponent differences, or park conditions drove the increase.
+
+## Did Release Characteristics Help Explain Fastball Changes?
+
+### Season-Average Release Characteristics
+
+Changes in release position, extension, and arm angle could accompany changes in fastball velocity and movement.
+I first compare seasonal averages, then test whether these measurements improve predictions beyond season and pitching context.
+
+```{r}
+#| label: release-characteristics
+release_season <- skenes_metrics |>
+  filter(pitch_type == "FF") |>
+  group_by(season) |>
+  summarise(
+    release_side = mean(release_pos_x, na.rm = TRUE),
+    release_height = mean(release_pos_z, na.rm = TRUE),
+    extension = mean(release_extension, na.rm = TRUE),
+    arm_angle = mean(arm_angle, na.rm = TRUE),
+    .groups = "drop") |>
+  arrange(season)
+
+release_season |>
+  knitr::kable(
+    format = "html",
+    digits = c(0, 2, 2, 2, 1),
+    align = c("l", rep("c", 4)),
+    col.names = c(
+      "Season",
+      "Horizontal Release (ft)",
+      "Release Height (ft)",
+      "Extension (ft)",
+      "Arm Angle (°)"),
+    caption = "Four-Seam Fastball: Average Release Characteristics") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C") |>
+  kableExtra::row_spec(
+    which(as.character(release_season$season) == "2026"),
+    bold = TRUE,
+    background = "#FFF5D6") |>
+  kableExtra::footnote(
+    general = paste(
+      "Averages use individual four-seam pitches with available measurements.",
+      "Horizontal release is measured from the catcher's perspective;",
+      "negative values indicate the catcher's left."),
+    general_title = "Note: ")
+```
+
+Skenes’s average four-seam arm angle increased from 24.3° in 2025 to 26.5° in 2026, while release height and extension changed relatively little.
+Over the same period, four-seam velocity declined from 98.2 to 96.8 mph, IVB increased from 11.6 to 13.0 inches, and horizontal movement became less negative, changing from −14.0 to −12.5 inches.
+These concurrent changes warrant investigating whether his delivery was associated with a different fastball shape.
+Season averages alone do not establish that the higher arm angle caused the velocity decline or increased home runs.
+
+These are pitch-weighted averages and can conceal changes within a season.
+Horizontal release alone cannot distinguish a mechanical change from a change in positioning on the rubber.
+Arm angle and release height describe different aspects of delivery and need not move together.
+
+### Velocity and IVB Models
+
+For each outcome, I compare a context forest with a forest adding horizontal and vertical release position, extension, and arm angle.
+Context includes season, day of year, cumulative pitch count, days since the previous game, count, and batter handedness.
+Both models use the same complete-case sample and 1,000 trees with a fixed random seed.
+The final 10 eligible 2026 outings are held out intact; earlier pitches are used for training.
+
+RMSE penalizes large errors more heavily; MAE describes average absolute error.
+Both are expressed in the outcome's units: mph for velocity and inches for IVB.
+Errors are calculated within outings and then combined with equal weight per outing.
+These models assess same-pitch associations, not the effect of a mechanical intervention or a forecast based solely on pre-pitch information.
+
+```{r}
+#| label: release-model-sample
+context_vars <- c(
+  "season",
+  "day_of_year",
+  "game_pitch_number",
+  "pitcher_days_since_prev_game",
+  "balls",
+  "strikes",
+  "stand")
+
+release_vars <- c(
+  "release_pos_x",
+  "release_pos_z",
+  "release_extension",
+  "arm_angle")
+
+model_data <- skenes_metrics |>
+  filter(pitch_type == "FF") |>
+  mutate(
+    game_date = as.Date(game_date),
+    day_of_year = as.integer(format(game_date, "%j")),
+    stand = factor(stand)) |>
+  select(
+    game_pk, game_date,
+    all_of(context_vars),
+    all_of(release_vars),
+    release_speed,
+    induced_vertical_break) |>
+  drop_na()
+
+# Check how many pitches remain in the complete-case sample
+model_data |>
+  count(season, name = "model_pitches") |>
+  knitr::kable(format = "html", col.names = c("Season", "Complete-case pitches"),
+    caption = "Four-seam model sample") |>
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r}
+#| label: release-model-holdout
+# Reserve the last 10 outings of 2026 for testing
+test_games <- model_data |>
+  filter(season == "2026") |>
+  distinct(game_pk, game_date) |>
+  arrange(game_date, game_pk) |>
+  slice_tail(n = 10)
+
+stopifnot(nrow(test_games) == 10)
+
+test_start <- min(test_games$game_date)
+
+skenes_train <- model_data |>
+  filter(game_date < test_start)
+
+skenes_test <- model_data |>
+  semi_join(test_games, by = "game_pk")
+
+# Confirm the training and testing sets contain different outings
+stopifnot(
+  nrow(skenes_train) > 0,
+  nrow(skenes_test) > 0,
+  any(skenes_train$season == "2026"),
+  length(intersect(
+    skenes_train$game_pk,
+    skenes_test$game_pk)) == 0)
+```
+
+```{r}
+#| label: fit-velocity-forests
+set.seed(123)
+
+rf_velocity_context <- randomForest(
+  release_speed ~
+    season +
+    day_of_year +
+    game_pitch_number +
+    pitcher_days_since_prev_game +
+    balls +
+    strikes +
+    stand,
+  data = as.data.frame(skenes_train),
+  ntree = 1000,
+  importance = TRUE)
+
+set.seed(123)
+
+rf_velocity_release <- randomForest(
+  release_speed ~
+    season +
+    day_of_year +
+    game_pitch_number +
+    pitcher_days_since_prev_game +
+    balls +
+    strikes +
+    stand +
+    release_pos_x +
+    release_pos_z +
+    release_extension +
+    arm_angle,
+  data = as.data.frame(skenes_train),
+  ntree = 1000,
+  importance = TRUE)
+
+```
+
+```{r}
+#| label: velocity-results
+velocity_predictions <- skenes_test |>
+  mutate(
+    training_mean = mean(skenes_train$release_speed),
+
+    context_prediction = as.numeric(
+      predict(
+        rf_velocity_context,
+        newdata = as.data.frame(skenes_test))),
+
+    release_prediction = as.numeric(
+      predict(
+        rf_velocity_release,
+        newdata = as.data.frame(skenes_test))))
+
+# Calculate errors within outings, then weight outings equally
+velocity_results <- velocity_predictions |>
+  select(
+    game_pk,
+    release_speed,
+    training_mean,
+    context_prediction,
+    release_prediction) |>
+  pivot_longer(
+    cols = c(
+      training_mean,
+      context_prediction,
+      release_prediction),
+    names_to = "model",
+    values_to = "predicted_velocity") |>
+  group_by(model, game_pk) |>
+  summarise(
+    mse = mean((release_speed - predicted_velocity)^2),
+    mae = mean(abs(release_speed - predicted_velocity)),
+    .groups = "drop") |>
+  group_by(model) |>
+  summarise(
+    RMSE = sqrt(mean(mse)),
+    MAE = mean(mae),
+    .groups = "drop") |>
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "training_mean",
+        "context_prediction",
+        "release_prediction"),
+      labels = c(
+        "Training Mean",
+        "Context",
+        "Context + Release"))) |>
+  arrange(model)
+
+velocity_results |>
+  knitr::kable(
+    format = "html",
+    digits = 2,
+    col.names = c("Model", "RMSE (mph)", "MAE (mph)"),
+    caption = "Four-Seam Velocity: Test-Set Performance") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C") |>
+  kableExtra::footnote(
+    general = paste(
+      "Evaluated on the final 10 available outings of 2026.",
+      "Each outing receives equal weight.",
+      "Lower errors indicate better predictions."),
+    general_title = "Note: ")
+```
+
+Adding release position, extension, and arm angle improved four-seam velocity predictions on the final 10 available outings of 2026.
+RMSE decreased from 0.94 to 0.87 mph, while MAE decreased from 0.74 to 0.68 mph.
+This suggests that release characteristics provide predictive information beyond season, workload, count, and batter handedness.
+However, this improvement does not establish that delivery changes caused the velocity decline or identify one release variable as responsible.
+
+This result describes the final holdout only.
+The chronological validation below checks whether the improvement repeats in earlier periods.
+
+The second comparison uses the same predictors and held-out outings, with IVB as the outcome.
+
+```{r}
+#| label: fit-ivb-forests
+set.seed(123)
+
+rf_ivb_context <- randomForest(
+  induced_vertical_break ~
+    season +
+    day_of_year +
+    game_pitch_number +
+    pitcher_days_since_prev_game +
+    balls +
+    strikes +
+    stand,
+  data = as.data.frame(skenes_train),
+  ntree = 1000,
+  importance = TRUE)
+
+set.seed(123)
+
+rf_ivb_release <- randomForest(
+  induced_vertical_break ~
+    season +
+    day_of_year +
+    game_pitch_number +
+    pitcher_days_since_prev_game +
+    balls +
+    strikes +
+    stand +
+    release_pos_x +
+    release_pos_z +
+    release_extension +
+    arm_angle,
+  data = as.data.frame(skenes_train),
+  ntree = 1000,
+  importance = TRUE)
+```
+
+```{r}
+#| label: ivb-results
+ivb_predictions <- skenes_test |>
+  mutate(
+    training_mean = mean(skenes_train$induced_vertical_break),
+
+    context_prediction = as.numeric(
+      predict(
+        rf_ivb_context,
+        newdata = as.data.frame(skenes_test))),
+
+    release_prediction = as.numeric(
+      predict(rf_ivb_release,
+        newdata = as.data.frame(skenes_test))))
+
+# Calculate pitch-level errors within outings,
+# then give each outing equal weight.
+ivb_results <- ivb_predictions |>
+  select(
+    game_pk,
+    induced_vertical_break,
+    training_mean,
+    context_prediction,
+    release_prediction) |>
+  pivot_longer(
+    cols = c(
+      training_mean,
+      context_prediction,
+      release_prediction),
+    names_to = "model",
+    values_to = "predicted_ivb") |>
+  group_by(model, game_pk) |>
+  summarise(
+    mse = mean((induced_vertical_break - predicted_ivb)^2),
+    mae = mean(abs(induced_vertical_break - predicted_ivb)),
+    .groups = "drop") |>
+  group_by(model) |>
+  summarise(
+    RMSE = sqrt(mean(mse)),
+    MAE = mean(mae),
+    .groups = "drop") |>
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "training_mean",
+        "context_prediction",
+        "release_prediction"),
+      labels = c(
+        "Training Mean",
+        "Context",
+        "Context + Release"))) |>
+  arrange(model)
+
+ivb_results |>
+  knitr::kable(
+    format = "html",
+    digits = 2,
+    col.names = c("Model", "RMSE (in)", "MAE (in)"),
+    caption = "Four-Seam IVB: Test-Set Performance") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C") |>
+  kableExtra::row_spec(
+    3,
+    bold = TRUE,
+    background = "#FFF5D6") |>
+  kableExtra::footnote(
+    general = paste(
+      "Evaluated on the same final 10 available outings of 2026",
+      "used for the velocity models. Each outing receives equal weight.",
+      "Lower errors indicate better predictions."),
+    general_title = "Note: ")
+```
+
+Adding release position, extension, and arm angle improved four-seam IVB predictions on the final 10 available outings of 2026.
+RMSE decreased from 1.66 to 1.54 inches, while MAE decreased from 1.36 to 1.23 inches.
+Together with the velocity-model results, this suggests that release characteristics provide additional predictive information about Skenes’s fastball velocity and movement beyond season and pitching context.
+These findings do not establish which delivery changes caused the season-level differences or whether those changes caused poorer results.
+
+### Chronological Validation
+
+To assess consistency, I repeat the comparisons in two earlier test blocks as well as the original final holdout.
+The first five eligible 2026 outings are reserved before testing begins so season is represented in every training sample.
+Each model uses only outings preceding its test block, with model settings held fixed.
+Earlier test blocks are smaller than the final 10-outing block; training histories also differ.
+The date table below is calculated from the eligible model sample, not all appearances.
+
+```{r}
+#| label: validation-periods
+games_2026 <- model_data |>
+  filter(season == "2026") |>
+  distinct(game_pk, game_date) |>
+  arrange(game_date, game_pk)
+
+# Reserve five eligible 2026 outings before testing begins
+remaining_games <- games_2026 |>
+  slice(-(1:5))
+
+stopifnot(nrow(remaining_games) >= 14)
+
+# Keep the original final 10 outings unchanged
+earlier_games <- remaining_games |>
+  slice_head(n = nrow(remaining_games) - 10)
+
+first_block_size <- floor(nrow(earlier_games) / 2)
+
+validation_games <- bind_rows(
+  earlier_games |>
+    slice_head(n = first_block_size) |>
+    mutate(period = "Earlier block 1"),
+
+  earlier_games |>
+    slice_tail(n = nrow(earlier_games) - first_block_size) |>
+    mutate(period = "Earlier block 2"),
+
+  remaining_games |>
+    slice_tail(n = 10) |>
+    mutate(period = "Original final block"))
+
+validation_games |>
+  group_by(period) |>
+  summarise(
+    first_date = min(game_date),
+    last_date = max(game_date),
+    outings = n(),
+    .groups = "drop") |>
+  knitr::kable(format = "html",
+    col.names = c("Test period", "First date", "Last date", "Outings"),
+    caption = "Chronological test periods") |>
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r}
+#| label: run-chronological-validation
+validate_forest <- function(target, outcome_label, period_label) {
+
+  held_out_games <- validation_games |>
+    filter(period == period_label)
+
+  cutoff <- min(held_out_games$game_date)
+
+  training_data <- model_data |>
+    filter(game_date < cutoff)
+
+  testing_data <- model_data |>
+    semi_join(held_out_games, by = "game_pk")
+
+  stopifnot(
+    nrow(training_data) > 0,
+    any(training_data$season == "2026"),
+    n_distinct(testing_data$game_pk) == nrow(held_out_games))
+
+  # Context model
+  set.seed(123)
+
+  context_model <- randomForest(
+    formula = reformulate(context_vars, response = target),
+    data = as.data.frame(training_data),
+    ntree = 1000,
+    mtry = max(1, floor(length(context_vars) / 3)),
+    nodesize = 5,
+    importance = TRUE)
+
+  # Context + release model
+  all_predictors <- c(context_vars, release_vars)
+
+  set.seed(123)
+
+  release_model <- randomForest(
+    formula = reformulate(all_predictors, response = target),
+    data = as.data.frame(training_data),
+    ntree = 1000,
+    mtry = max(1, floor(length(all_predictors) / 3)),
+    nodesize = 5,
+    importance = TRUE)
+
+  predictions <- tibble(
+    game_pk = testing_data$game_pk,
+    actual = testing_data[[target]],
+
+    Context = as.numeric(predict(
+      context_model,
+      newdata = as.data.frame(testing_data))),
+
+    `Context + Release` = as.numeric(predict(
+      release_model,
+      newdata = as.data.frame(testing_data))))
+
+  predictions |>
+    pivot_longer(
+      cols = c("Context", "Context + Release"),
+      names_to = "model",
+      values_to = "predicted") |>
+    group_by(model, game_pk) |>
+    summarise(
+      mse = mean((actual - predicted)^2),
+      mae = mean(abs(actual - predicted)),
+      .groups = "drop") |>
+    group_by(model) |>
+    summarise(
+      RMSE = sqrt(mean(mse)),
+      MAE = mean(mae),
+      .groups = "drop") |>
+    mutate(
+      outcome = outcome_label,
+      period = period_label)}
+
+validation_results <- purrr::map_dfr(
+  unique(validation_games$period),
+  function(period_label) {bind_rows(
+      validate_forest(
+        "release_speed", "Velocity (mph)", period_label),
+      validate_forest(
+        "induced_vertical_break", "IVB (in)", period_label))})
+```
+
+```{r}
+#| label: validation-results
+validation_table <- validation_results |>
+  mutate(
+    model = recode(
+      model,
+      "Context" = "context",
+      "Context + Release" = "release")) |>
+  pivot_wider(
+    id_cols = c(outcome, period),
+    names_from = model,
+    values_from = c(RMSE, MAE),
+    names_glue = "{.value}_{model}") |>
+  mutate(
+    rmse_improvement = 100 *
+      (RMSE_context - RMSE_release) / RMSE_context,
+
+    mae_improvement = 100 *
+      (MAE_context - MAE_release) / MAE_context,
+
+    period = factor(
+      period,
+      levels = c(
+        "Earlier block 1",
+        "Earlier block 2",
+        "Original final block"))) |>
+  arrange(outcome, period) |>
+  select(
+    outcome, period,
+    RMSE_context, RMSE_release, rmse_improvement,
+    MAE_context, MAE_release, mae_improvement)
+
+validation_table |>
+  knitr::kable(
+    format = "html",
+    digits = 2,
+    col.names = c(
+      "Outcome", "Test Period",
+      "Context RMSE", "Release RMSE", "Improvement %",
+      "Context MAE", "Release MAE", "Improvement %"),
+    caption = "Chronological Validation: Do Release Measurements Help?") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0, bold = TRUE, color = "black", background = "#F2C94C") |>
+  kableExtra::footnote(
+    general = paste(
+      "Earlier test blocks contain fewer outings; the final holdout contains 10. Training uses only earlier games.",
+      "Each test outing receives equal weight.",
+      "Positive improvement means lower error after adding release measurements."),
+    general_title = "Note: ")
+```
+
+Chronological validation showed that the predictive value of release measurements varied across test periods.
+Adding release characteristics improved velocity predictions in two of three periods but worsened them in the middle period.
+For IVB, release measurements provided little or no improvement in the earlier periods, with the clearest benefit occurring in the final holdout.
+These findings suggest that release characteristics contained useful predictive information under some conditions, but do not establish a consistent explanation for the season-long changes in velocity or movement.
+
+The percentages measure reductions in prediction error, not the proportion of the velocity decline explained.
+The windows are a consistency check rather than independent replications, and no uncertainty interval for error differences is estimated here.
+The variable-importance plot is retained in the technical appendix; it does not identify the direction or causal importance of a release change.
+
+## Did Expected Fastball Velocity Relate to Secondary-Pitch Chase?
+
+### Hypothesis and Measurement
+
+My hypothesis was that hitters preparing for Skenes's higher-velocity fastball had less time to distinguish it from secondary pitches, potentially making them more susceptible to chasing outside the zone.
+That expectation can exist before the first fastball of an outing and can develop across games, not merely within one at-bat.
+
+I use the average four-seam velocity over the previous three starts as a proxy for the fastball a hitter might expect entering the game.
+Only earlier outings enter this average; the first three outings of each season are excluded.
+The prediction is that higher expected velocity is associated with greater chase odds on comparable secondary pitches.
+
+The analysis includes outside-zone changeups, splitters, sliders, and sweepers with complete measurements.
+It models swings versus takes, not misses conditional on swinging.
+The rolling average is a proxy for preparation, not an observation of a hitter's expectations or decision timing.
+
+```{r}
+#| label: prepare-expectation-hypothesis
+# Four-seam velocity by outing
+fastball_history <- skenes_metrics |>
+  filter(
+    pitch_type == "FF",
+    !is.na(release_speed)) |>
+  mutate(game_date = as.Date(game_date)) |>
+  group_by(season, game_pk, game_date) |>
+  summarise(
+    avg_fastball_velocity = mean(release_speed),
+    .groups = "drop") |>
+  arrange(season, game_date, game_pk) |>
+  group_by(season) |>
+  mutate(
+    # Equal-weight average of the previous three outings.
+    # First three outings of each season have no estimate.
+    expected_fastball_velocity = (
+      lag(avg_fastball_velocity, 1) +
+      lag(avg_fastball_velocity, 2) +
+      lag(avg_fastball_velocity, 3)) / 3) |>
+  ungroup()
+
+hypothesis_data <- skenes_metrics |>
+  left_join(
+    fastball_history |>
+      select(game_pk, expected_fastball_velocity),
+    by = "game_pk") |>
+  filter(
+    pitch_type %in% c("CH", "FS", "SL", "ST"),
+    in_zone %in% FALSE,
+    !is.na(description),
+    description != "",
+    sz_top > sz_bot) |>
+  mutate(
+    game_date = as.Date(game_date),
+    chase = as.integer(swing),
+    pitch_type = factor(pitch_type),
+    stand = factor(stand),
+    relative_height = (plate_z - sz_bot) / (sz_top - sz_bot)) |>
+  select(
+    game_pk, game_date, season,
+    chase, expected_fastball_velocity,
+    pitch_type, plate_x, relative_height,
+    release_speed, induced_vertical_break,
+    horizontal_break, balls, strikes,
+    stand, game_pitch_number) |>
+  drop_na()
+```
+
+```{r}
+#| label: expected-velocity-coverage
+hypothesis_data |>
+  distinct(season, game_pk, expected_fastball_velocity) |>
+  group_by(season) |>
+  summarise(
+    outings = n(),
+    mean_expected_velocity = mean(expected_fastball_velocity),
+    minimum = min(expected_fastball_velocity),
+    maximum = max(expected_fastball_velocity),
+    .groups = "drop") |>
+  knitr::kable(
+    format = "html", digits = 2,
+    col.names = c("Season", "Outings", "Mean expected velocity", "Minimum", "Maximum"),
+    caption = "Expected Fastball Velocity Available for Chase Analysis")
+```
+
+In the analyzed sample, the 2026 expected-velocity range does not overlap with those of the earlier seasons.
+Season adjustment therefore makes this primarily a comparison of velocity variation within seasons; it cannot cleanly separate the broad year-to-year decline from other seasonal changes.
+
+### Logistic Regression Results
+
+A logistic regression estimates the association between expected fastball velocity and chase, controlling for season, pitch type, location, secondary-pitch velocity and movement, count, batter handedness, and pitch count.
+Spline terms allow nonlinear location relationships.
+The analysis uses all eligible observations for exploratory association estimation rather than the random forests' training/test split.
+Uncertainty is clustered by outing because pitches in a game share the same expected-fastball value; the confidence intervals use an approximate t reference with outing count minus one degrees of freedom.
+
+An odds ratio above 1 indicates higher chase odds per 1 mph higher expected velocity; a value below 1 indicates lower odds.
+An interval containing 1 leaves the direction uncertain.
+Odds ratios are not percentage-point changes in chase probability.
+
+```{r}
+#| label: fit-chase-hypothesis
+
+chase_hypothesis_model <- glm(
+  chase ~
+    expected_fastball_velocity +
+    season +
+    pitch_type +
+    splines::ns(plate_x, df = 3) +
+    splines::ns(relative_height, df = 3) +
+    release_speed +
+    induced_vertical_break +
+    horizontal_break +
+    factor(balls) +
+    factor(strikes) +
+    stand +
+    game_pitch_number,
+  data = hypothesis_data,
+  family = binomial(),
+  na.action = na.fail)
+```
+
+```{r}
+#| label: chase-hypothesis-results
+cluster_covariance <- sandwich::vcovCL(
+  chase_hypothesis_model,
+  cluster = hypothesis_data$game_pk,
+  type = "HC1")
+
+term <- "expected_fastball_velocity"
+
+estimate <- coef(chase_hypothesis_model)[term]
+standard_error <- sqrt(diag(cluster_covariance))[term]
+
+# Approximate inference using the number of outing clusters
+outing_count <- n_distinct(hypothesis_data$game_pk)
+critical_value <- qt(0.975, df = outing_count - 1)
+
+hypothesis_results <- tibble(
+  comparison = "1 mph higher expected fastball velocity",
+  odds_ratio = exp(estimate),
+  lower_95 = exp(estimate - critical_value * standard_error),
+  upper_95 = exp(estimate + critical_value * standard_error),
+  p_value = 2 * pt(
+    abs(estimate / standard_error),
+    df = outing_count - 1,
+    lower.tail = FALSE))
+
+hypothesis_results |>
+  knitr::kable(
+    format = "html",
+    digits = 3,
+    col.names = c(
+      "Comparison", "Odds Ratio",
+      "95% CI Lower", "95% CI Upper", "P-value"),
+    caption = "Expected Fastball Velocity and Secondary-Pitch Chase") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "black",
+    background = "#F2C94C")
+```
+
+The primary estimate was 0.937 (95% CI: 0.646–1.358; p = 0.726).
+Higher expected fastball velocity was not clearly associated with increased secondary-pitch chase after adjustment.
+The estimate was uncertain and does not rule out the proposed relationship.
+
+::: {.callout-note title="What this test cannot establish"}
+The model does not measure swing commitment, hitter-specific scouting expectations, intentional long-term setup, or pitch tunneling.
+It assumes a common expected-velocity association across the included secondary pitches and seasons.
+Holding secondary-pitch characteristics and location fixed targets a conditional association, not the total effect of an arsenal changing together.
+:::
+
+### Sensitivity Checks
+
+I test whether the association depends on a three- versus five-start history, separate linear time trends within each season, or inclusion of pitches near the recorded zone boundaries.
+The three- and five-start comparisons use the same five-start-eligible sample; the clearly-outside check is a subset of that sample.
+Its pitch-center threshold is 0.2 feet beyond a horizontal or vertical recorded zone edge, an analysis choice rather than an official strike-zone definition.
+
+Statcast changed plate-location reference points and zone definitions in 2026.
+Relative-height normalization and exclusion of borderline pitches do not fully harmonize these measurements.
+
+```{r}
+#| label: prepare-chase-sensitivity
+# Add a five-start average to the existing fastball history
+fastball_history_check <- fastball_history |>
+  arrange(season, game_date, game_pk) |>
+  group_by(season) |>
+  mutate(
+    expected_fastball_5 = (
+      lag(avg_fastball_velocity, 1) +
+      lag(avg_fastball_velocity, 2) +
+      lag(avg_fastball_velocity, 3) +
+      lag(avg_fastball_velocity, 4) +
+      lag(avg_fastball_velocity, 5)) / 5) |>
+  ungroup()
+
+# Rebuild the chase data, keeping the zone measurements
+sensitivity_data <- skenes_metrics |>
+  left_join(
+    fastball_history_check |>
+      select(
+        game_pk,
+        expected_fastball_velocity,
+        expected_fastball_5),
+    by = "game_pk") |>
+  filter(
+    pitch_type %in% c("CH", "FS", "SL", "ST"),
+    in_zone %in% FALSE,
+    !is.na(description),
+    description != "",
+    sz_top > sz_bot) |>
+  mutate(
+    game_date = as.Date(game_date),
+    day_of_year = as.integer(format(game_date, "%j")),
+
+    chase = as.integer(swing),
+    pitch_type = factor(pitch_type),
+    stand = factor(stand),
+
+    relative_height =
+      (plate_z - sz_bot) / (sz_top - sz_bot),
+
+    # Same 0.2-foot margin used in the earlier chase analysis
+    clearly_outside =
+      abs(plate_x) > (17 / 24 + 0.2) |
+      plate_z < (sz_bot - 0.2) |
+      plate_z > (sz_top + 0.2)) |>
+  select(
+    game_pk, game_date, season, day_of_year,
+    chase, expected_fastball_velocity,
+    expected_fastball_5,
+    pitch_type, plate_x, relative_height,
+    release_speed, induced_vertical_break,
+    horizontal_break, balls, strikes,
+    stand, game_pitch_number, clearly_outside) |>
+  drop_na()
+```
+
+```{r}
+#| label: fit-chase-sensitivity
+# Three-start model refitted on the common sample
+chase_three_start <- update(
+  chase_hypothesis_model,
+  data = sensitivity_data)
+
+# Replace the three-start estimate with the five-start estimate
+chase_five_start <- update(
+  chase_three_start,
+  . ~ . - expected_fastball_velocity + expected_fastball_5,
+  data = sensitivity_data)
+
+# Add a separate linear time trend for each season
+chase_time_adjusted <- update(
+  chase_three_start,
+  . ~ . + day_of_year + season:day_of_year,
+  data = sensitivity_data)
+
+# Exclude pitches near the recorded zone boundaries
+clear_sensitivity_data <- sensitivity_data |>
+  filter(clearly_outside)
+
+chase_clearly_outside <- update(
+  chase_three_start,
+  data = clear_sensitivity_data)
+```
+
+```{r}
+#| label: chase-sensitivity-results
+extract_chase_result <- function(model, data, term, label) {
+
+  covariance <- sandwich::vcovCL(
+    model,
+    cluster = data$game_pk,
+    type = "HC1")
+
+  estimate <- unname(coef(model)[term])
+  standard_error <- unname(sqrt(diag(covariance))[term])
+
+  outings <- n_distinct(data$game_pk)
+  critical_value <- qt(0.975, df = outings - 1)
+
+  tibble(
+    check = label,
+    outings = outings,
+    pitches = nobs(model),
+    odds_ratio = exp(estimate),
+    lower_95 = exp(estimate - critical_value * standard_error),
+    upper_95 = exp(estimate + critical_value * standard_error),
+    p_value = 2 * pt(
+      abs(estimate / standard_error),
+      df = outings - 1,
+      lower.tail = FALSE))}
+
+chase_sensitivity_results <- bind_rows(
+  extract_chase_result(
+    chase_three_start,
+    sensitivity_data,
+    "expected_fastball_velocity",
+    "Three-start average"),
+  extract_chase_result(
+    chase_five_start,
+    sensitivity_data,
+    "expected_fastball_5",
+    "Five-start average"),
+  extract_chase_result(
+    chase_time_adjusted,
+    sensitivity_data,
+    "expected_fastball_velocity",
+    "Three-start + seasonal time trends"),
+  extract_chase_result(
+    chase_clearly_outside,
+    clear_sensitivity_data,
+    "expected_fastball_velocity",
+    "Three-start: clearly outside only"))
+
+chase_sensitivity_results |>
+  knitr::kable(
+    format = "html",
+    digits = 3,
+    col.names = c(
+      "Check", "Outings", "Pitches",
+      "Odds Ratio", "95% CI Lower", "95% CI Upper", "P-value"),
+    caption = "Sensitivity Checks: Expected Fastball Velocity and Chase") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("hover", "condensed", "responsive"),
+    full_width = FALSE,
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0, bold = TRUE, color = "black", background = "#F2C94C") |>
+  kableExtra::footnote(
+    general = paste(
+      "Odds ratios represent 1 mph higher expected fastball velocity.",
+      "All checks begin with the same five-start-eligible sample.",
+      "Uncertainty is clustered by outing.",
+      "The clearly-outside model uses a subset of that sample."),
+    general_title = "Note: ")
+```
+
+The expected-fastball-velocity hypothesis was not consistently supported across sensitivity checks.
+Odds ratios ranged from 0.827 to 1.214, and all 95% confidence intervals included 1.
+The estimated direction varied with the averaging window, adjustment for seasonal time trends, and exclusion of borderline pitches.
+These results do not establish that higher expected fastball velocity increased secondary-pitch chase, although the wide confidence intervals leave meaningful positive and negative associations plausible.
+
+The matched-sample three-start estimate differs from the original model because the first five rather than first three outings of each season must be excluded.
+The models are reported together rather than selecting the specification with the smallest p-value.
+Overlapping velocity-history windows and serial dependence between outings may not be fully addressed by outing-clustered uncertainty.
+
+## Conclusions and Player-Development Implications
+
+### Performance changed across several parts of the arsenal
+
+Skenes's sampled 2026 performance featured fewer strikeouts, more walks, and more home runs than in 2025.
+The four-seamer accounted for seven of the eight additional home runs, with 1,167 four-seam pitches in 2025 and 1,143 in 2026 and lower average exit velocity and hard-hit rate.
+The changeup and sweeper also showed reduced chase and whiff rates.
+The decline therefore cannot be summarized adequately by fastball velocity alone.
+
+### Release measurements helped under some conditions
+
+Average arm angle increased while four-seam velocity and movement changed.
+Adding release measurements improved predictions in the final holdout, but the benefit varied across chronological test periods.
+This is evidence of useful predictive relationships under some conditions, not proof that a particular delivery change caused poorer results.
+
+### The fastball-expectation hypothesis remains unresolved
+
+The tested proxy for expected fastball velocity did not show a clear, stable association with secondary-pitch chase.
+Sensitivity estimates varied in direction and retained wide confidence intervals.
+That finding does not establish that hitter anticipation is irrelevant; it describes what these measurements and models could resolve.
+
+The findings support closer video and scouting review of fastball delivery, damaging-contact locations, and secondary-pitch recognition.
+They do not justify prescribing a specific arm-angle or mechanical adjustment from these data alone.
+A stronger causal account would need information about intended targets, hitter preparation, swing timing, and other factors not available here.
+
+## Limitations
+
+- **Sample coverage and selection:** The analysis covers nearly all of Skenes's 2026 regular season through September 22, potentially excluding one remaining start.
+  The 2024 and 2025 comparisons cover his full regular seasons, with 2024 beginning at his MLB debut.
+  The samples therefore differ in season coverage and number of outings.
+  Only one pitcher is studied; less-used pitches have small contact samples, and complete-case filtering can change the represented outings and pitches.
+
+- **Observational evidence:** Opponents, parks, weather, health, catcher decisions, and tactical changes could contribute to the observed patterns.
+  No injury or deliberate mechanical change is established by these models.
+
+- **Command and hitter expectations:** Actual location does not reveal the intended target.
+  Previous-start velocity is only a proxy for expectations; individual hitter exposure, reputation, swing commitment, and tunneling are not directly measured.
+
+- **Measurement comparability:** Statcast changed location references and zone definitions in 2026.
+  Pitch classifications may also evolve.
+  Normalization and boundary exclusions do not eliminate these issues.
+
+- **Release-model interpretation:** Release predictors are correlated and observed on the same pitch as velocity and movement.
+  Importance rankings cannot isolate a mechanical cause.
+  The models do not directly predict home runs or total effectiveness, and improved prediction is not the percentage of a performance decline explained.
+
+- **Validation limits:** Test blocks differ in size and available training history.
+  Later training samples include earlier test periods.
+  Model settings were fixed rather than extensively tuned, and uncertainty for error differences was not quantified.
+  Regression forests also have limited ability to extrapolate beyond training conditions.
+
+- **Limited velocity overlap and model assumptions:** The expected-velocity range in 2026 does not overlap earlier seasons.
+  Season-adjusted results primarily use within-season variation and assume a common conditional association across pitch types.
+  Adjustment for pitch characteristics does not estimate every pathway through which an arsenal could influence hitters.
+
+- **Exploratory testing and dependence:** Hypotheses developed during analysis, and several models were examined.
+  Outing-clustered uncertainty addresses within-game dependence but not necessarily serial dependence across starts.
+  The rolling history windows overlap.
+  Uncertain results should not be interpreted as proof of no baseball effect.
+
+## Sources and Reproducibility
+
+- [Baseball Savant Statcast search](https://baseballsavant.mlb.com/statcast_search): pitch-level data source.
+- [Statcast CSV documentation](https://baseballsavant.mlb.com/csv-docs): field definitions and measurement changes.
+- [baseballr documentation](https://billpetti.github.io/baseballr/): data acquisition tools.
+- [randomForest documentation](https://cran.r-project.org/package=randomForest): regression forests.
+- [sandwich clustered covariance documentation](https://sandwich.r-forge.r-project.org/reference/vcovCL.html): outing-clustered uncertainty.
+
+## Technical Appendix
+
+### Model Summary and Variable Importance
+
+The console summary below reports out-of-bag performance and is retained for technical transparency; the chronological holdouts are the primary evaluation.
+Permutation importance describes prediction reliance, not causal effects or direction.
+The default scaled importance scores should not be read as literal percentages of explained decline.
+
+```{r}
+#| label: forest-console-summary
+print(rf_velocity_release)
+```
+
+```{r}
+#| label: velocity-importance
+#| fig-width: 9
+#| fig-height: 5
+#| fig-alt: "Permutation importance ranking for the velocity forest; importance does not indicate causal effects."
+varImpPlot(
+  rf_velocity_release,
+  type = 1,
+  main = "Four-Seam Velocity: Variable Importance")
+```
