@@ -1,0 +1,1000 @@
+---
+title: "Forecasting Hitter Skills"
+subtitle: "Strikeout rate, walk rate, and power projections for 2027"
+author: "Andy Lucas"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  message: false
+---
+<style>
+p code, li code, td code { color: inherit; }
+pre.sourceCode code, pre.sourceCode span { color: #333333 !important; }
+</style>
+
+
+```{r}
+#| include: false
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(randomForest)
+library(DT)
+
+report_table <- function(data, caption, digits = 2, col_names = names(data)) {
+  data |>
+    knitr::kable(
+      format = "html",
+      escape = TRUE,
+      row.names = FALSE,
+      digits = digits,
+      col.names = col_names,
+      caption = caption) |>
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = TRUE,
+      position = "left",
+      font_size = 13) |>
+    kableExtra::row_spec(
+      0,
+      bold = TRUE,
+      color = "white",
+      background = "#24557A") |>
+    kableExtra::column_spec(
+      1,
+      bold = TRUE,
+      color = "#24557A") |>
+    kableExtra::scroll_box(width = "100%") }
+
+# Metric names and units are defined once for all three targets.
+target_info <- tibble(
+  target = c("k", "bb", "iso"),
+  label = c("K%", "BB%", "ISO"),
+  current = c("k_rate", "bb_rate", "iso"),
+  outcome = c("next_k_rate", "next_bb_rate", "next_iso"),
+  multiplier = c(100, 100, 1),
+  unit = c("pp", "pp", "ISO"))
+
+# Shift by exact calendar years so missing seasons never become false lags.
+add_history <- function(data) {
+  required <- c("player_id", "season", "pa", "strikeouts", "walks", "at_bats", "doubles", "triples", "home_runs")
+  stopifnot(all(required %in% names(data)))
+  stopifnot(!anyDuplicated(data[c("player_id", "season")]))
+
+  history <- data
+  for (lag_year in 1:2) {
+    prior <- data |>
+      select(all_of(required)) |>
+      mutate(season = season + lag_year) |>
+      rename_with(
+        ~ paste0(.x, "_lag", lag_year),
+        -c(player_id, season))
+
+    history <- history |>
+      left_join(
+        prior,
+        by = c("player_id", "season"),
+        relationship = "one-to-one") }
+
+  history |>
+    mutate(
+      history_seasons = 1L + as.integer(!is.na(pa_lag1)) + as.integer(!is.na(pa_lag2)),
+      history_pa = pa + coalesce(pa_lag1, 0L) + coalesce(pa_lag2, 0L),
+      history_ab = at_bats + coalesce(at_bats_lag1, 0L) + coalesce(at_bats_lag2, 0L),
+      k_rate_3yr = (strikeouts + coalesce(strikeouts_lag1, 0L) + coalesce(strikeouts_lag2, 0L)) / history_pa,
+      bb_rate_3yr = (walks + coalesce(walks_lag1, 0L) + coalesce(walks_lag2, 0L)) / history_pa,
+      iso_bases = doubles + 2 * triples + 3 * home_runs,
+      iso_bases_lag1 = coalesce(doubles_lag1, 0L) + 2 * coalesce(triples_lag1, 0L) + 3 * coalesce(home_runs_lag1, 0L),
+      iso_bases_lag2 = coalesce(doubles_lag2, 0L) + 2 * coalesce(triples_lag2, 0L) + 3 * coalesce(home_runs_lag2, 0L),
+      iso_3yr = (iso_bases + iso_bases_lag1 + iso_bases_lag2) / na_if(history_ab, 0L),
+      has_previous_season = as.integer(!is.na(pa_lag1)),
+      k_change_previous = k_rate - coalesce(strikeouts_lag1 / na_if(pa_lag1, 0L), k_rate),
+      bb_change_previous = bb_rate - coalesce(walks_lag1 / na_if(pa_lag1, 0L), bb_rate),
+      iso_change_previous = iso - coalesce(iso_bases_lag1 / na_if(at_bats_lag1, 0L), iso)) }
+
+fit_candidate <- function(data, target, model_name) {
+  info <- target_info |>
+    filter(.data$target == .env$target)
+  predictors <- switch(model_name,
+    "Rate-only linear" = info$current,
+    "Expanded linear" = "k_rate + bb_rate + iso + age + log(pa)",
+    "History linear" = paste(
+      "k_rate + bb_rate + iso + age + log(pa) +",
+      "k_rate_3yr + bb_rate_3yr + iso_3yr + history_seasons +",
+      "has_previous_season +",
+      switch(target,
+        k = "k_change_previous",
+        bb = "bb_change_previous",
+        iso = "iso_change_previous")),
+    "Random forest" = "k_rate + bb_rate + iso + age + pa",
+    stop("Unknown candidate: ", model_name))
+  formula <- as.formula(paste(info$outcome, "~", predictors))
+
+  if (model_name == "Random forest") {
+    set.seed(123)
+    return(randomForest(
+      formula,
+      data = data,
+      ntree = 500,
+      mtry = 2,
+      nodesize = 20,
+      importance = TRUE)) }
+
+  lm(formula, data = data) }
+
+predict_candidate <- function(model, data, target, model_name) {
+  info <- target_info |>
+    filter(.data$target == .env$target)
+  prediction <- switch(model_name,
+    "Baseline" = data[[info$current]],
+    "Three-year baseline" = data[[paste0(info$current, "_3yr")]],
+    as.numeric(predict(model, newdata = data)))
+
+  tibble(
+    player_id = data$player_id,
+    player_name = data$player_name,
+    predictor_season = data$season,
+    forecast_year = data$season + 1L,
+    target = target,
+    model = model_name,
+    actual = data[[info$outcome]],
+    predicted = prediction,
+    error = prediction - actual) }
+
+score_predictions <- function(predictions, by_year = FALSE) {
+  groups <- c("target", "model", if (by_year) "forecast_year")
+
+  predictions |>
+    group_by(across(all_of(groups))) |>
+    summarise(
+      hitters = n(),
+      mae = mean(abs(error)),
+      rmse = sqrt(mean(error^2)),
+      bias = mean(error),
+      .groups = "drop") |>
+    left_join(target_info, by = "target") |>
+    mutate(
+      mae = mae * multiplier,
+      rmse = rmse * multiplier,
+      bias = bias * multiplier) }
+
+check_intervals <- function(model, data, target, level = 0.80) {
+  info <- target_info |>
+    filter(.data$target == .env$target)
+  intervals <- predict(
+    model,
+    newdata = data,
+    interval = "prediction",
+    level = level)
+  actual <- data[[info$outcome]]
+
+  tibble(
+    target = target,
+    forecast_year = unique(data$season + 1L),
+    hitters = nrow(data),
+    coverage_pct = mean(actual >= intervals[, "lwr"] & actual <= intervals[, "upr"]) * 100,
+    below_pct = mean(actual < intervals[, "lwr"]) * 100,
+    above_pct = mean(actual > intervals[, "upr"]) * 100,
+    mean_width = mean(intervals[, "upr"] - intervals[, "lwr"]) * info$multiplier,
+    unit = info$unit) }
+
+benchmark_names <- c("Baseline", "Three-year baseline")
+
+candidate_names <- c(benchmark_names, "Rate-only linear", "Expanded linear", "History linear", "Random forest")
+```
+
+## Project Overview
+
+A hitter can take a step forward in several ways: make more contact, draw more walks, or do more damage when he connects. I built this project to forecast those pieces separately through strikeout rate (K%), walk rate (BB%), and isolated power (ISO). The central question is whether a hitter's recent track record helps us project next season better than simply expecting a repeat of his latest year.
+
+The final product is a searchable set of 2027 hitter projections, with model-based 80% prediction intervals for each skill. In R, I use reusable functions to prepare player histories, compare linear models with random forests, and evaluate forecasts across seasons. These projections provide a starting point for player evaluation; forecasting an overall offensive breakout would require a broader definition and additional testing.
+
+```{r}
+#| include: false
+batting <- readRDS("data/batting_seasons.rds")
+
+# Fail clearly if data or season coverage differs from the report design.
+stopifnot(all(2010:2026 %in% batting$season))
+stopifnot(!anyDuplicated(batting[c("player_id", "season")]))
+stopifnot(all(batting$pa > 0))
+stopifnot(all(batting$strikeouts >= 0 & batting$strikeouts <= batting$pa))
+stopifnot(all(batting$walks >= 0 & batting$walks <= batting$pa))
+
+batting_history <- add_history(batting)
+
+next_season <- batting |>
+  transmute(
+    player_id,
+    season = season - 1L,
+    outcome_season = season + 1L,
+    next_pa = pa,
+    next_k_rate = k_rate,
+    next_bb_rate = bb_rate,
+    next_iso = iso)
+
+forecast_data <- batting_history |>
+  left_join(
+    next_season,
+    by = c("player_id", "season"),
+    relationship = "one-to-one")
+
+model_data <- forecast_data |>
+  filter(
+    pa >= 200,
+    next_pa >= 100,
+    !is.na(next_k_rate),
+    !is.na(next_bb_rate),
+    !is.na(next_iso))
+
+stopifnot(all(model_data$outcome_season == model_data$season + 1L))
+stopifnot(!anyNA(select(model_data, k_rate, bb_rate, iso, age, k_rate_3yr, bb_rate_3yr, iso_3yr)))
+
+train_data <- model_data |>
+  filter(season <= 2022)
+
+validation_data <- model_data |>
+  filter(season %in% c(2023, 2024))
+
+test_data <- model_data |>
+  filter(season == 2025)
+
+stopifnot(max(train_data$outcome_season) <= min(validation_data$season))
+stopifnot(max(validation_data$outcome_season) <= min(test_data$season))
+
+# Fit every target and candidate through the same functions.
+validation_models <- list()
+validation_predictions <- list()
+for (target in target_info$target) {
+  validation_models[[target]] <- list()
+  for (model_name in candidate_names) {
+    model <- if (model_name %in% benchmark_names) NULL else fit_candidate(train_data, target, model_name)
+    validation_models[[target]][[model_name]] <- model
+    validation_predictions[[paste(target, model_name)]] <- predict_candidate(
+      model,
+      validation_data,
+      target,
+      model_name) } }
+
+validation_predictions <- bind_rows(validation_predictions)
+validation_scores <- score_predictions(validation_predictions)
+
+# Select by validation MAE only. The forest remains a full comparison model.
+selected_models <- validation_scores |>
+  filter(!model %in% benchmark_names) |>
+  group_by(target) |>
+  arrange(mae, model, .by_group = TRUE) |>
+  slice_head(n = 1) |>
+  ungroup()
+
+# Model-based intervals require a selected linear model.
+if (any(selected_models$model == "Random forest")) {
+  stop("A forest won validation MAE. Review interval construction before deploying it.") }
+
+final_training <- bind_rows(train_data, validation_data)
+final_models <- list()
+test_predictions <- list()
+for (target in target_info$target) {
+  model_name <- selected_models$model[selected_models$target == target]
+  final_models[[target]] <- fit_candidate(final_training, target, model_name)
+  test_predictions[[paste(target, model_name)]] <- predict_candidate(
+    final_models[[target]],
+    test_data,
+    target,
+    model_name)
+  test_predictions[[paste(target, "Baseline")]] <- predict_candidate(
+    NULL,
+    test_data,
+    target,
+    "Baseline")
+  test_predictions[[paste(target, "Three-year baseline")]] <- predict_candidate(
+    NULL,
+    test_data,
+    target,
+    "Three-year baseline") }
+
+test_predictions <- bind_rows(test_predictions)
+test_scores <- score_predictions(test_predictions)
+
+headline_results <- test_scores |>
+  filter(!model %in% benchmark_names) |>
+  select(target, label, unit, model, hitters, model_mae = mae, model_rmse = rmse, model_bias = bias) |>
+  left_join(
+    test_scores |>
+      filter(model == "Baseline") |>
+      select(target, baseline_mae = mae, baseline_rmse = rmse),
+    by = "target") |>
+  mutate(mae_reduction_pct = (1 - model_mae / baseline_mae) * 100)
+
+# Preserve the familiar object names used in the existing diagnostic plots.
+k_final_model <- final_models$k
+bb_final_model <- final_models$bb
+iso_final_model <- final_models$iso
+
+make_test_table <- function(target) {
+  info <- target_info |>
+    filter(.data$target == .env$target)
+  predictions <- test_predictions |>
+    filter(.data$target == .env$target, !model %in% benchmark_names) |>
+    select(player_id, predicted, model_error = error)
+
+  test_data |>
+    left_join(predictions, by = "player_id", relationship = "one-to-one") |>
+    mutate(baseline_error = .data[[info$current]] - .data[[info$outcome]]) |>
+    rename_with(~ paste0("predicted_", info$current), predicted) }
+
+k_test_predictions <- make_test_table("k")
+bb_test_predictions <- make_test_table("bb")
+iso_test_predictions <- make_test_table("iso")
+
+interval_coverage <- bind_rows(lapply(target_info$target, function(target) {
+  check_intervals(final_models[[target]], test_data, target) }))
+```
+
+### Results at a Glance
+
+The history models won validation for contact, walks, and power. In the 2026 evaluation, they reduced average absolute error relative to repeating the previous season by `r sprintf("%.1f", headline_results$mae_reduction_pct[headline_results$target == "k"])`% for K%, `r sprintf("%.1f", headline_results$mae_reduction_pct[headline_results$target == "bb"])`% for BB%, and `r sprintf("%.1f", headline_results$mae_reduction_pct[headline_results$target == "iso"])`% for ISO. They also posted lower pooled historical MAE than the random forests for all three skills. That supports using a hitter's longer track record, although the 2026 evaluation was exposed during development and is not an untouched test.
+
+The first checkpoint is how well the selected models forecast 2026 from information available at the end of 2025. The table below compares each model with a simple baseball baseline: the hitter repeats his previous season's rate. Lower MAE means the forecasts were closer to what hitters actually produced, on average.
+
+```{r}
+headline_results |>
+  transmute(
+    Target = label,
+    Units = unit,
+    Model = model,
+    Hitters = hitters,
+    `Baseline MAE` = sprintf(if_else(target == "iso", "%.4f", "%.2f"), baseline_mae),
+    `Model MAE` = sprintf(if_else(target == "iso", "%.4f", "%.2f"), model_mae),
+    `MAE reduction (%)` = round(mae_reduction_pct, 1)) |>
+  report_table(caption = "2026 forecasting results", digits = 1)
+```
+
+## Data and Forecasting Design
+
+I use regular-season batting totals from 2010–2026, downloaded from the [MLB Stats API](https://statsapi.mlb.com/api/v1/stats?stats=season&group=hitting&season=2026&sportIds=1&playerPool=ALL&limit=10000&gameType=R) through get_data.R and saved as data/batting_seasons.rds. K% and BB% measure strikeouts and walks per plate appearance. ISO measures extra bases per at-bat: (doubles + 2 × triples + 3 × home runs) / at-bats. It gives the project a measure of game power alongside contact and plate discipline. The report uses the saved data snapshot so rendering does not require another download.
+
+To build a season-to-season comparison, I require at least 200 PA in the starting season and 100 PA the following year, with all three outcomes available. That keeps the focus on hitters with some major-league playing time in both seasons, although a 100-PA outcome is still a limited sample. Each eligible player-season pair counts equally in evaluation. Player IDs keep records aligned across seasons, and data checks flag duplicate records, missing seasons, implausible counts, and information crossing the forecasting cutoff.
+
+### Multi-Season Features
+
+One season can give an incomplete picture of a hitter. I add the two preceding calendar years to give the model a longer track record. Three-year K% and BB% combine strikeout or walk counts and PA; three-year ISO combines extra bases and at-bats. A 600-PA season therefore carries more weight than a brief call-up, rather than treating both annual rates equally.
+
+The history model also records how many seasons are available, whether the hitter played in the previous year, and how the target skill changed from that year. Earlier seasons with no record add no counts. When a previous-year comparison is unavailable, the change is set to zero and an indicator records the missing history, keeping eligible rookies in the sample. Everything comes from information available by the end of the starting season.
+
+### Training, Validation, and Evaluation Samples
+
+I train the initial models on 2010–2022 starting seasons and compare candidates on 2023–2024 starting seasons, always predicting the following year. The 2026 evaluation then asks how the selected models performed using 2025 information. I had already examined preliminary K% and BB% results for 2026 during development, so I treat this as a development-exposed evaluation. The history features are judged against the same earlier validation seasons, and a future season will offer a cleaner prospective check.
+
+```{r}
+tibble(
+  Dataset = c("Training", "Validation", "2026 evaluation"),
+  `Predictor years` = c("2010–2022", "2023–2024", "2025"),
+  `Outcome years` = c("2011–2023", "2024–2025", "2026"),
+  `Hitter-season pairs` = c(nrow(train_data), nrow(validation_data), nrow(test_data))) |>
+  report_table(caption = "Chronological dataset design", digits = 0)
+```
+
+## Model Comparisons
+
+Every model has to compete with the repeat-last-season baseline. A second benchmark carries forward the three-year PA-weighted K% or BB%, or the at-bat-weighted ISO, without fitting a regression. For hitters with less history, it uses the available seasons. This asks whether the history model adds value beyond simply smoothing a hitter's recent results. Both benchmarks remain comparisons; model selection is among the fitted candidates. Rate-only regression asks how much of a hitter's latest rate tends to carry into the next year. Expanded regression adds current K%, BB%, ISO, age, and log(PA), allowing the broader offensive profile to inform each forecast. History regression adds the longer track record. Random forests test whether more flexible relationships improve predictions, using current rates, age, and PA with 500 trees, two predictors considered per split, and nodesize = 20.
+
+I select a model for each skill using the lowest pooled validation MAE, then check RMSE, bias, and the individual seasons for context. Contact, discipline, and power do not have to favor the same model. Random forests use the same player-season samples as the regressions, so they earn their place through forecast performance. The current interval calculations support linear models; if a forest wins, the report stops so its uncertainty can be handled appropriately before producing projections.
+
+MAE answers a practical question: how far off was the typical forecast, on average? RMSE gives more weight to the biggest misses. Bias shows whether the model leaned high or low, using predicted minus actual. K% and BB% errors are reported in percentage points (pp): a forecast of 20% against an actual 23% misses by 3 pp. ISO errors remain in ISO units. All candidates use the same scoring function.
+
+```{r}
+validation_scores |>
+  arrange(target, mae) |>
+  transmute(
+    Target = label,
+    Model = model,
+    Units = unit,
+    Hitters = hitters,
+    MAE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), mae),
+    RMSE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), rmse),
+    Bias = sprintf(if_else(target == "iso", "%.4f", "%.3f"), bias)) |>
+  report_table(caption = "All candidates on the same validation observations")
+```
+
+### Selected Formulas
+
+The formulas below show which inputs made it into the validation-selected models. Extra information earns its place by improving forecasts on those earlier seasons. A small edge in MAE is useful for choosing a candidate, but does not establish that it will consistently outperform the alternatives.
+
+```{r}
+selected_models |>
+  transmute(
+    Target = label,
+    Model = model,
+    Formula = vapply(target, function(target) {
+      model_name <- selected_models$model[selected_models$target == target]
+      paste(deparse(formula(validation_models[[target]][[model_name]])), collapse = " ") }, character(1))) |>
+  report_table(caption = "Validation-selected models")
+```
+
+### Validation by Forecast Year
+
+A pooled result can hide a season in which a model struggled. This table puts the linear models and forests side by side by forecast year, making it easier to see whether an apparent advantage carries across both seasons.
+
+```{r}
+score_predictions(validation_predictions, by_year = TRUE) |>
+  arrange(target, forecast_year, mae) |>
+  transmute(
+    Target = label,
+    `Forecast year` = forecast_year,
+    Model = model,
+    Units = unit,
+    Hitters = hitters,
+    MAE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), mae),
+    RMSE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), rmse),
+    Bias = sprintf(if_else(target == "iso", "%.4f", "%.3f"), bias)) |>
+  report_table(caption = "Validation accuracy by target and forecast year")
+```
+
+## Rolling Historical Backtest
+
+Before putting much weight on the latest evaluation, I check how the models would have handled earlier seasons. For each forecast year from 2016–2025, I refit every candidate using only outcomes available through the preceding year, then predict from the hitter's prior-season information. The training window grows as more seasons become available, using the same functions for each skill.
+
+This backtest asks whether the value of a longer track record holds up across different baseball seasons. The candidate settings stay fixed throughout. These are retrospective checks that overlap the validation years, so they provide evidence about stability rather than additional untouched tests. The shortened 2020 season also changes which hitters clear the PA thresholds and deserves consideration when reading the year-to-year results.
+
+```{r}
+#| include: false
+# Each fold uses only outcomes known by the end of its predictor season.
+backtest_predictions <- list()
+backtest_coverage <- list()
+for (predictor_year in 2015:2024) {
+  fold_train <- model_data |>
+    filter(outcome_season <= predictor_year)
+  fold_test <- model_data |>
+    filter(season == predictor_year)
+
+  stopifnot(max(fold_train$outcome_season) <= min(fold_test$season))
+  for (target in target_info$target) {
+    for (model_name in candidate_names) {
+      model <- if (model_name %in% benchmark_names) NULL else fit_candidate(fold_train, target, model_name)
+      key <- paste(predictor_year, target, model_name)
+      backtest_predictions[[key]] <- predict_candidate(
+        model,
+        fold_test,
+        target,
+        model_name)
+
+      if (model_name %in% c("Rate-only linear", "Expanded linear", "History linear")) {
+        backtest_coverage[[key]] <- check_intervals(model, fold_test, target) |>
+          mutate(model = model_name) } } } }
+
+backtest_predictions <- bind_rows(backtest_predictions)
+backtest_coverage <- bind_rows(backtest_coverage)
+backtest_scores <- score_predictions(backtest_predictions, by_year = TRUE)
+
+backtest_relative <- backtest_scores |>
+  left_join(
+    backtest_scores |>
+      filter(model == "Baseline") |>
+      select(target, forecast_year, baseline_mae = mae),
+    by = c("target", "forecast_year")) |>
+  mutate(mae_reduction_pct = (1 - mae / baseline_mae) * 100)
+```
+
+```{r}
+score_predictions(backtest_predictions) |>
+  arrange(target, mae) |>
+  transmute(
+    Target = label,
+    Model = model,
+    Units = unit,
+    `Hitter-season pairs` = hitters,
+    MAE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), mae),
+    RMSE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), rmse),
+    Bias = sprintf(if_else(target == "iso", "%.4f", "%.3f"), bias)) |>
+  report_table(caption = "Pooled rolling-backtest accuracy, 2016–2025")
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 7
+#| fig-cap: "Positive values indicate lower MAE than carrying the previous season's rate forward. Each fold uses only earlier outcomes."
+backtest_relative |>
+  filter(model != "Baseline") |>
+  ggplot(aes(x = forecast_year, y = mae_reduction_pct, color = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray45") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ label, ncol = 1) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_color_manual(values = c(
+    "Rate-only linear" = "#7892A5",
+    "Expanded linear" = "#24557A",
+    "History linear" = "#16816A",
+    "Random forest" = "#AF703B",
+      "Three-year baseline" = "#666666")) +
+  labs(
+    title = "Forecast Improvement Across Seasons",
+    x = "Forecast year",
+    y = "MAE reduction vs. baseline (%)",
+    color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "bottom")
+```
+
+```{r}
+backtest_coverage |>
+  group_by(target, model) |>
+  summarise(
+    hitter_pairs = sum(hitters),
+    coverage_pct = weighted.mean(coverage_pct, hitters),
+    .groups = "drop") |>
+  left_join(select(target_info, target, label), by = "target") |>
+  transmute(
+    Target = label,
+    Model = model,
+    `Hitter-season pairs` = hitter_pairs,
+    `80% interval coverage (%)` = coverage_pct) |>
+  report_table(caption = "Rolling-backtest interval coverage", digits = 1)
+```
+
+## 2026 Evaluation
+
+With the formulas selected, I refit them on the training and validation pairs and forecast the 2026 season. MAE shows the average miss, RMSE highlights larger misses, and bias shows the direction of error. These evaluation fits are kept separate from the later refits used to produce 2027 projections.
+
+```{r}
+headline_results |>
+  transmute(
+    Target = label,
+    Units = unit,
+    Hitters = hitters,
+    `Baseline RMSE` = sprintf(if_else(target == "iso", "%.4f", "%.2f"), baseline_rmse),
+    `Model RMSE` = sprintf(if_else(target == "iso", "%.4f", "%.2f"), model_rmse),
+    `Model bias` = sprintf(if_else(target == "iso", "%.4f", "%.2f"), model_bias)) |>
+  report_table(caption = "2026 forecast RMSE and bias")
+```
+
+### What Does the Model Add Beyond a Longer Track Record?
+
+The three-year benchmark gives the model a tougher comparison than repeating one season. The table below scores both benchmarks and the validation-selected model on exactly the same 2026 hitters. A lower model MAE than the three-year benchmark indicates that the fitted relationships added value beyond using a longer sample alone. This comparison does not change model selection or the 2027 projections. In this evaluation, the history models beat the three-year benchmark for all three skills. The K% and BB% advantages are small, while the ISO difference is larger. Much of the improvement over repeating last season therefore comes from using a longer track record, with the regression adding a further edge whose size depends on the skill. These differences have not been established as statistically significant.
+
+```{r}
+test_scores |>
+  arrange(target, mae) |>
+  transmute(
+    Target = label,
+    Model = model,
+    Units = unit,
+    Hitters = hitters,
+    MAE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), mae),
+    RMSE = sprintf(if_else(target == "iso", "%.4f", "%.3f"), rmse),
+    Bias = sprintf(if_else(target == "iso", "%.4f", "%.3f"), bias)) |>
+  report_table(caption = "2026 accuracy against both carry-forward benchmarks")
+```
+
+### Power Forecasts
+
+Above the diagonal are hitters who produced more extra-base power than the model expected; below it are hitters who fell short. The spread is a reminder that projecting game power remains difficult at the individual level. An improved average forecast can still miss a hitter's big season or disappointing year by a wide margin. A projected ISO gain is a reason to look more closely at a player, rather than proof that his underlying power has changed.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "The dashed line indicates perfect predictions. Actual ISO varies more widely than the model’s forecasts."
+
+iso_test_predictions |> 
+  ggplot(aes(x = predicted_iso, y = next_iso)) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray45",
+    linewidth = 0.6) +
+  geom_point(
+    color = "#24557A",
+    alpha = 0.55,
+    size = 1.8) +
+  scale_x_continuous(
+    breaks = seq(0, 0.35, 0.05),
+    labels = scales::label_number(accuracy = 0.01)) +
+  scale_y_continuous(
+    breaks = seq(0, 0.35, 0.05),
+    labels = scales::label_number(accuracy = 0.01)) +
+  coord_equal(
+    xlim = c(0, 0.35),
+    ylim = c(0, 0.35)) +
+  labs(
+    title = "Forecasting Hitter Power",
+    subtitle = "2026 outcomes predicted from 2025 information",
+    x = "Predicted ISO",
+    y = "Actual ISO",
+    caption = sprintf(
+      "n = %d hitters | Model MAE: %.3f | Baseline MAE: %.3f",
+      nrow(iso_test_predictions),
+      mean(abs(iso_test_predictions$model_error)),
+      mean(abs(iso_test_predictions$baseline_error)))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray35"),
+    plot.caption = element_text(hjust = 0, color = "gray35"),
+    plot.title.position = "plot",
+    plot.caption.position = "plot")
+```
+
+### Largest Power Forecast Errors
+
+The biggest misses are useful places to start a closer baseball review. Negative errors mean a hitter outproduced his power forecast; positive errors mean the forecast was too high. I include the following season's PA to distinguish a short look from a fuller season. These totals alone cannot tell us whether an injury, swing adjustment, or role change explains a particular miss.
+
+```{r}
+iso_test_predictions |>
+  arrange(desc(abs(model_error))) |>
+  select(player_name, pa, next_pa, iso, predicted_iso, next_iso, model_error) |>
+  head(10) |>
+  report_table(
+    caption = "Largest absolute ISO forecast errors in 2026",
+    digits = 3,
+    col_names = c("Player", "2025 PA", "2026 PA", "2025 ISO", "Predicted ISO", "Actual ISO", "Error"))
+```
+
+### Power Forecast Errors by Playing Time
+
+A power rate from 150 PA carries a different amount of evidence than one from 600 PA. This table separates forecast errors by the playing time hitters actually received in 2026. That playing time is used only to examine the results afterward; it was unavailable when making the forecasts. Differences between groups can reflect both smaller samples and the way performance influences playing opportunities.
+
+```{r}
+iso_test_predictions |>
+  mutate(
+    outcome_pa_group = case_when(
+      next_pa < 200 ~ "100–199 PA",
+      next_pa < 400 ~ "200–399 PA",
+      TRUE ~ "400+ PA")) |>
+  group_by(outcome_pa_group) |>
+  summarise(
+    hitters = n(),
+    mae_iso = mean(abs(model_error)),
+    baseline_mae_iso = mean(abs(baseline_error)),
+    bias_iso = mean(model_error),
+    .groups = "drop") |>
+  report_table(
+    caption = "ISO accuracy by 2026 playing time",
+    digits = 4,
+    col_names = c("2026 PA group", "Hitters", "Model MAE", "Baseline MAE", "Bias"))
+```
+
+### Strikeout Rate Forecasts
+
+Hitters above the diagonal struck out more often than expected; hitters below it made contact more often than their forecast implied. The visual pattern shows how closely predictions track outcomes, while the model and baseline MAE in the caption show whether the forecast added value over repeating last season's K%.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "The dashed line indicates perfect predictions. Points above it represent hitters who struck out more often than forecast."
+k_test_predictions |> ggplot(aes(x = predicted_k_rate, y = next_k_rate)) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray45") +
+  geom_point(
+    color = "#24557A",
+    alpha = 0.55,
+    size = 1.8) +
+  scale_x_continuous(
+    labels = scales::label_percent(accuracy = 1), expand = expansion(mult = 0)) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1), expand = expansion(mult = 0)) +
+  coord_equal(
+    xlim = c(0, 0.45),
+    ylim = c(0, 0.45)) +
+  labs(
+    title = "Forecasting Hitter Strikeout Rate",
+    subtitle = "2026 outcomes predicted from 2025 information",
+    x = "Predicted K%",
+    y = "Actual K%",
+    caption = sprintf(
+      "n = %d hitters | Model MAE: %.2f pp | Baseline MAE: %.2f pp",
+      nrow(k_test_predictions),
+      mean(abs(k_test_predictions$model_error)) * 100,
+      mean(abs(k_test_predictions$baseline_error)) * 100)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray35"),
+    plot.caption = element_text(hjust = 0, color = "gray35"),
+    plot.title.position = "plot",
+    plot.caption.position = "plot")
+```
+
+### Walk Rate Forecasts
+
+Hitters above the diagonal drew walks more often than projected; those below it walked less often. Even players with similar projected BB% can finish with different results. I read this plot alongside the error tables to judge both the overall forecast quality and the room for individual surprises.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "The dashed line indicates perfect predictions. Points above it represent hitters who walked more often than forecast."
+
+# Use matching limits that include every prediction and outcome.
+bb_axis_max <- ceiling(
+  max(
+    bb_test_predictions$predicted_bb_rate,
+    bb_test_predictions$next_bb_rate) / 0.05) * 0.05
+
+ggplot(
+  bb_test_predictions,
+  aes(x = predicted_bb_rate, y = next_bb_rate)) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray45") +
+  geom_point(
+    color = "#24557A",
+    alpha = 0.55,
+    size = 1.8) +
+  scale_x_continuous(
+    labels = scales::label_percent(accuracy = 1),
+    breaks = seq(0, bb_axis_max, 0.05),
+    expand = expansion(mult = 0)) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1),
+    breaks = seq(0, bb_axis_max, 0.05),
+    expand = expansion(mult = 0)) +
+  coord_equal(
+    xlim = c(0, bb_axis_max),
+    ylim = c(0, bb_axis_max)) +
+  labs(
+    title = "Forecasting Hitter Walk Rate",
+    subtitle = "2026 outcomes predicted from 2025 information",
+    x = "Predicted BB%",
+    y = "Actual BB%",
+    caption = sprintf(
+      "n = %d hitters | Model MAE: %.2f pp | Baseline MAE: %.2f pp",
+      nrow(bb_test_predictions),
+      mean(abs(bb_test_predictions$model_error)) * 100,
+      mean(abs(bb_test_predictions$baseline_error)) * 100)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray35"),
+    plot.caption = element_text(hjust = 0, color = "gray35"),
+    plot.title.position = "plot",
+    plot.caption.position = "plot")
+```
+
+### Prediction Interval Coverage
+
+A point forecast is only part of the evaluation. The 80% prediction intervals describe a range for an individual hitter's next-season rate, and this table checks how often 2026 outcomes landed inside those ranges. Coverage near 80% across the full sample is encouraging, but does not tell us that the intervals work equally well for every type of hitter.
+
+```{r}
+interval_coverage |>
+  left_join(select(target_info, target, label), by = "target") |>
+  transmute(
+    Target = label,
+    Hitters = hitters,
+    `Coverage (%)` = coverage_pct,
+    `Below (%)` = below_pct,
+    `Above (%)` = above_pct,
+    `Mean width` = mean_width,
+    Units = unit) |>
+  report_table(caption = "Model-based 80% prediction interval coverage in 2026", digits = 2)
+```
+
+## 2027 Projections
+
+For the 2027 projections, I refit the selected models using all completed season pairs through 2025–2026. Every hitter with at least 200 PA in 2026 is eligible; future playing time is not required or predicted. Age is recorded as of the starting season, matching the way the models were trained.
+
+Each hitter receives a forecast and interval for contact, walks, and power separately. The three intervals do not together form an 80% range for his entire offensive profile. They also assume a common level of residual variability across hitters and cannot account for the amount of playing time a player will receive in 2027.
+
+```{r}
+#| include: false
+projection_training <- model_data |>
+  filter(outcome_season <= 2026)
+
+projection_models <- list()
+for (target in target_info$target) {
+  model_name <- selected_models$model[selected_models$target == target]
+  projection_models[[target]] <- fit_candidate(projection_training, target, model_name) }
+
+k_projection_model <- projection_models$k
+bb_projection_model <- projection_models$bb
+iso_projection_model <- projection_models$iso
+
+projection_data <- batting_history |>
+  filter(
+    season == 2026,
+    pa >= 200)
+
+# Construct forecasts and intervals together to preserve player alignment.
+k_intervals <- predict(
+  k_projection_model,
+  newdata = projection_data,
+  interval = "prediction",
+  level = 0.80)
+
+bb_intervals <- predict(
+  bb_projection_model,
+  newdata = projection_data,
+  interval = "prediction",
+  level = 0.80)
+
+iso_intervals <- predict(
+  iso_projection_model,
+  newdata = projection_data,
+  interval = "prediction",
+  level = 0.80)
+
+projections_2027 <- projection_data |>
+  mutate(
+    forecast_season = 2027L,
+    predicted_k_rate = k_intervals[, "fit"],
+    k_lower = k_intervals[, "lwr"],
+    k_upper = k_intervals[, "upr"],
+    predicted_bb_rate = bb_intervals[, "fit"],
+    bb_lower = bb_intervals[, "lwr"],
+    bb_upper = bb_intervals[, "upr"],
+    predicted_iso = iso_intervals[, "fit"],
+    iso_lower = iso_intervals[, "lwr"],
+    iso_upper = iso_intervals[, "upr"],
+    k_change_pp = (predicted_k_rate - k_rate) * 100,
+    bb_change_pp = (predicted_bb_rate - bb_rate) * 100,
+    iso_change = predicted_iso - iso)
+
+projection_display <- projections_2027 |>
+  transmute(
+    Player = player_name,
+    Age = age,
+    `2026 PA` = pa,
+    `Projected K%` = sprintf("%.1f%%", predicted_k_rate * 100),
+    `K% 80% interval` = sprintf("%.1f–%.1f%%", k_lower * 100, k_upper * 100),
+    `Projected BB%` = sprintf("%.1f%%", predicted_bb_rate * 100),
+    `BB% 80% interval` = sprintf("%.1f–%.1f%%", bb_lower * 100, bb_upper * 100),
+    `Projected ISO` = sprintf("%.3f", predicted_iso),
+    `ISO 80% interval` = sprintf("%.3f–%.3f", iso_lower, iso_upper))
+```
+
+### Hitter Projection Preview
+
+These first ten eligible hitters provide a quick look at the projection format. They retain the original download order; their position in the preview does not indicate a higher projected skill level or a stronger breakout case.
+
+```{r}
+projection_display |>
+  head(10) |>
+  knitr::kable(
+    format = "html",
+    escape = TRUE,
+    row.names = FALSE,
+    align = c("l", rep("r", 8)),
+    caption = "2027 hitter forecasts with model-based 80% prediction intervals") |>
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "left",
+    font_size = 13) |>
+  kableExtra::row_spec(
+    0,
+    bold = TRUE,
+    color = "white",
+    background = "#24557A") |>
+  kableExtra::column_spec(
+    1,
+    bold = TRUE,
+    color = "#24557A") |>
+  kableExtra::footnote(
+    general = paste(
+      "Includes hitters with at least 200 PA in 2026.",
+      "Ranges are model-based 80% prediction intervals",
+      "for each metric separately."),
+    general_title = "",
+    footnote_as_chunk = TRUE) |>
+  kableExtra::column_spec(
+    c(5, 7, 9),
+    extra_css = "white-space: nowrap;") |>
+  kableExtra::scroll_box(width = "100%")
+```
+
+### Projection Table
+
+Use the table to look up a hitter, compare his 2026 rates with his projections, or sort by a skill you want to investigate. A negative K% change means fewer projected strikeouts; positive BB% and ISO changes mean more projected walks and power. All eligible hitters are included, beginning in the original download order. The intervals help show how much uncertainty sits around each apparent improvement.
+
+```{r}
+projection_search <- projections_2027 |>
+  transmute(
+    Player = player_name,
+    Age = age,
+    `2026 PA` = pa,
+    `2026 K%` = k_rate,
+    `Projected K%` = predicted_k_rate,
+    `K change (pp)` = k_change_pp,
+    `K% 80% interval` = sprintf("%.1f–%.1f%%", k_lower * 100, k_upper * 100),
+    `2026 BB%` = bb_rate,
+    `Projected BB%` = predicted_bb_rate,
+    `BB change (pp)` = bb_change_pp,
+    `BB% 80% interval` = sprintf("%.1f–%.1f%%", bb_lower * 100, bb_upper * 100),
+    `2026 ISO` = iso,
+    `Projected ISO` = predicted_iso,
+    `ISO change` = iso_change,
+    `ISO 80% interval` = sprintf("%.3f–%.3f", iso_lower, iso_upper))
+
+projection_search |>
+  DT::datatable(
+    rownames = FALSE,
+    filter = "top",
+    class = "stripe hover compact",
+    caption = "2027 skill forecasts for all eligible hitters",
+    options = list(
+      pageLength = 20,
+      lengthMenu = c(10, 20, 50, 100),
+      order = list(),
+      scrollX = TRUE,
+      autoWidth = TRUE,
+      initComplete = DT::JS(
+        "function(settings, json) {",
+        "this.api().table().container().querySelectorAll('thead th').forEach(function(cell) {cell.style.backgroundColor = '#24557A'; cell.style.color = 'white';});",
+        "}"),
+      columnDefs = list(list(className = "dt-nowrap", targets = c(6, 10, 14))))) |>
+  DT::formatPercentage(c("2026 K%", "Projected K%", "2026 BB%", "Projected BB%"), digits = 1) |>
+  DT::formatRound(c("K change (pp)", "BB change (pp)"), digits = 2) |>
+  DT::formatRound(c("2026 ISO", "Projected ISO", "ISO change"), digits = 3) |>
+  DT::formatStyle(
+    columns = names(projection_search),
+    target = "cell",
+    color = "#24557A",
+    fontSize = "13px")
+```
+
+### How to Use These Forecasts
+
+I would use these forecasts as the start of a player evaluation. Projected skill level and projected improvement answer different baseball questions: a hitter can remain a strong power threat without setting a new career high, while a hitter coming off a low ISO can project to improve partly because the model pulls extreme seasons toward more typical results. Sorting by the largest gain alone can overstate the case for a breakout.
+
+Yordan Alvarez, Luis Arraez, and Ezequiel Tovar provide contrasting profiles for reading the projections. For each player, I would compare the recent sample, current rates, projected changes, and intervals, then investigate what pitch-level data or scouting observations might support that forecast. These examples illustrate how to use the table; they have not been validated as a breakout shortlist.
+
+```{r}
+projections_2027 |>
+  filter(player_name %in% c("Yordan Alvarez", "Luis Arraez", "Ezequiel Tovar")) |>
+  transmute(
+    Player = player_name,
+    `History seasons` = history_seasons,
+    `History PA` = history_pa,
+    `Current K%` = sprintf("%.1f%%", k_rate * 100),
+    `Projected K%` = sprintf("%.1f%%", predicted_k_rate * 100),
+    `Current BB%` = sprintf("%.1f%%", bb_rate * 100),
+    `Projected BB%` = sprintf("%.1f%%", predicted_bb_rate * 100),
+    `Current ISO` = iso,
+    `Projected ISO` = predicted_iso) |>
+  report_table(caption = "Contrasting player profiles", digits = 3)
+```
+
+```{r}
+#| include: false
+player_value <- function(player, column, digits = 1, percent = FALSE) {
+  value <- projections_2027 |>
+    filter(player_name == player) |>
+    pull(all_of(column))
+  stopifnot(length(value) == 1L)
+  sprintf(paste0("%.", digits, "f"), value * if (percent) 100 else 1) }
+```
+
+#### Yordan Alvarez: Power remains the calling card
+
+Alvarez's sustained power production is essential context for this forecast. His projected `r player_value("Yordan Alvarez", "predicted_iso", 3)` ISO and `r player_value("Yordan Alvarez", "predicted_bb_rate", percent = TRUE)`% walk rate describe a hitter who can do considerable damage while making pitchers work in the zone. The decline from his current `r player_value("Yordan Alvarez", "iso", 3)` ISO is consistent with regression, rather than clear evidence of diminished power. His 80% ISO prediction interval of `r player_value("Yordan Alvarez", "iso_lower", 3)`–`r player_value("Yordan Alvarez", "iso_upper", 3)` leaves room for another season near his recent production. I would examine barrel rate, hard-hit rate, and swing decisions to assess whether his quality of contact supports another dominant season.
+
+#### Luis Arraez: An exceptional ability to make contact
+
+Arraez's ability to put the bat on the ball is the defining feature of his offensive profile. His K% moves from `r player_value("Luis Arraez", "k_rate", percent = TRUE)`% to a projected `r player_value("Luis Arraez", "predicted_k_rate", percent = TRUE)`%, still describing remarkably few strikeouts. That increase is consistent with regression from an extreme contact rate, rather than clear evidence that his bat-to-ball ability is slipping. His 80% K% prediction interval of `r player_value("Luis Arraez", "k_lower", percent = TRUE)`–`r player_value("Luis Arraez", "k_upper", percent = TRUE)`% leaves considerable uncertainty around the expected change. I would examine zone-contact rate, chase rate, and whiff rate by pitch type to determine whether any sustained changes support a stronger case for decline.
+
+#### Ezequiel Tovar: A closer look at the power projection
+
+Tovar's projected improvement comes primarily through power, with relatively little change in contact or walk rate. Across `r player_value("Ezequiel Tovar", "pa", 0)` PA in 2026, he gave the model a substantial recent sample to evaluate. His ISO moves from `r player_value("Ezequiel Tovar", "iso", 3)` to `r player_value("Ezequiel Tovar", "predicted_iso", 3)`, while K% changes by `r player_value("Ezequiel Tovar", "k_change_pp")` percentage points and BB% by `r player_value("Ezequiel Tovar", "bb_change_pp")` points. More extra-base damage could strengthen his offensive contribution, but the forecast offers little evidence of a major change in his approach. His 80% ISO prediction interval of `r player_value("Ezequiel Tovar", "iso_lower", 3)`–`r player_value("Ezequiel Tovar", "iso_upper", 3)` also includes his current production. I would examine barrel rate, hard-hit rate, and launch-angle distribution to assess whether his batted-ball profile supports the projected power gain.
+
+## Limitations
+
+The evaluation follows hitters who returned for at least 100 PA the next year. It leaves out players who did not return to MLB or received fewer opportunities, while the 200-PA starting threshold excludes many rookies and bench players. The results therefore describe rate forecasts for this eligible group, rather than predicting who will earn a roster spot or a full season of playing time.
+
+Season totals capture what a hitter produced, but leave out much of the baseball context behind it. Contact quality, ballpark, opponent quality, injuries, and swing changes could help explain why a player took a step forward or fell back. A longer track record adds useful context without identifying the cause of development. K%, BB%, and ISO also cover only part of offensive value, so this project does not yet establish a probability of an overall breakout.
+
+The shortened 2020 season and changes in the league environment complicate comparisons across years. Players appear in multiple seasons, and their outcome samples differ in size, which can challenge regression assumptions. The intervals assume common residual variance and may extend beyond physically possible values. I display them without clipping so those limitations remain visible; their observed group coverage is not a guarantee for a particular hitter.
+
+I also keep the evaluation history in view: the backtest overlaps some validation years, and I examined preliminary K% and BB% results for 2026 during development. The final formulas are selected using earlier validation MAE, but the later evaluation still reflects that development process. Small model differences have not been established as statistically meaningful. Tracking these forecasts against a future season would be the next step toward judging how useful they are in practice.
