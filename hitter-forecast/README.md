@@ -14,7 +14,7 @@ These are skill forecasts, not validated probabilities of an overall offensive b
 
 ## View the report
 
-Read the [live report](https://andylucas13.github.io/hitter-forecast/hitter_breakout_forecast.html) once this folder is published to the portfolio. You can also open `hitter_breakout_forecast.html` locally after downloading or cloning the repository. Keep `hitter_breakout_forecast_files/` beside it: that folder contains the figures, styling, and interactive-table dependencies. GitHub's file view shows HTML source rather than running the report.
+Read the [live report](https://andylucas13.github.io/hitter-forecast/hitter_breakout_forecast.html). You can also open `hitter_breakout_forecast.html` locally after downloading or cloning the repository. Keep `hitter_breakout_forecast_files/` beside it: that folder contains the figures, styling, and interactive-table dependencies. GitHub's file view shows HTML source rather than running the report.
 
 ## Skills demonstrated
 
